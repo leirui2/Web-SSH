@@ -1,0 +1,16 @@
+[Unit]
+Description=SmartEyes WEB SSH
+After=network.target
+Requires=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jsd/web-ssh
+ExecStart=/usr/bin/java -jar ss-terminal-1.0.0.jar
+Restart=on-failure
+RestartSec=3
+Environment="JAVA_OPTS=-Xms256m -Xmx512m"
+Environment="SPRING_PROFILES_ACTIVE=prod"
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <title>SSH服务器配置管理</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .config-form {
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            box-sizing: border-box;
+        }
+        .form-group textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            box-sizing: border-box;
+            height: 80px;
+        }
+        .btn {
+            padding: 10px 15px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        .btn:hover {
+            background-color: #45a049;
+        }
+        .btn-cancel {
+            background-color: #f44336;
+        }
+        .btn-cancel:hover {
+            background-color: #da190b;
+        }
+        .btn-edit {
+            background-color: #2196F3;
+        }
+        .btn-edit:hover {
+            background-color: #0b7dda;
+        }
+        .btn-delete {
+            background-color: #f44336;
+        }
+        .btn-delete:hover {
+            background-color: #da190b;
+        }
+        .server-list {
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .server-list table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .server-list th, .server-list td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        .server-list th {
+            background-color: #f2f2f2;
+        }
+        .server-list tr:hover {
+            background-color: #f5f5f5;
+        }
+        .action-buttons {
+            display: flex;
+            gap: 5px;
+        }
+        .search-box {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+        }
+        .search-box input {
+            flex: 1;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+        }
+        .search-box button {
+            padding: 8px 15px;
+        }
+        .nav-buttons {
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SSH服务器配置管理</h1>
+        
+        <div class="nav-buttons">
+            <a href="/ssh-client" class="btn">返回SSH客户端</a>
+        </div>
+        
+        <div class="config-form" id="config-form">
+            <h2 id="form-title">添加新服务器</h2>
+            <form id="server-form">
+                <input type="hidden" id="server-id">
+                <div class="form-group">
+                    <label for="server-name">服务器名称</label>
+                    <input type="text" id="server-name" placeholder="输入服务器名称" required>
+                </div>
+                <div class="form-group">
+                    <label for="server-host">主机地址</label>
+                    <input type="text" id="server-host" placeholder="例如: 192.168.1.1" required>
+                </div>
+                <div class="form-group">
+                    <label for="server-port">端口</label>
+                    <input type="number" id="server-port" placeholder="22" value="22" required>
+                </div>
+                <div class="form-group">
+                    <label for="server-username">用户名</label>
+                    <input type="text" id="server-username" placeholder="输入用户名" required>
+                </div>
+                <div class="form-group">
+                    <label for="server-password">密码</label>
+                    <input type="password" id="server-password" placeholder="输入密码" required>
+                </div>
+                <div class="form-group">
+                    <label for="server-description">描述</label>
+                    <textarea id="server-description" placeholder="输入服务器描述（可选）"></textarea>
+                </div>
+                <div>
+                    <button type="submit" class="btn" id="save-btn">保存</button>
+                    <button type="button" class="btn btn-cancel" id="cancel-btn">取消</button>
+                </div>
+            </form>
+        </div>
+        
+        <div class="search-box">
+            <input type="text" id="search-input" placeholder="搜索服务器...">
+            <button class="btn" id="search-btn">搜索</button>
+            <button class="btn" id="reset-search-btn">重置</button>
+        </div>
+        
+        <div class="server-list">
+            <h2>服务器列表</h2>
+            <table id="server-table">
+                <thead>
+                    <tr>
+                        <th>名称</th>
+                        <th>主机</th>
+                        <th>端口</th>
+                        <th>用户名</th>
+                        <th>描述</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="server-list-body">
+                    <!-- 服务器列表将在这里动态生成 -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // 当前编辑的服务器ID
+        let currentEditId = null;
+        
+        // 页面加载完成后执行
+        document.addEventListener('DOMContentLoaded', function() {
+            // 加载服务器列表
+            loadServerList();
+            
+            // 表单提交事件
+            document.getElementById('server-form').addEventListener('submit', function(e) {
+                e.preventDefault();
+                saveServerConfig();
+            });
+            
+            // 取消按钮事件
+            document.getElementById('cancel-btn').addEventListener('click', function() {
+                resetForm();
+            });
+            
+            // 搜索按钮事件
+            document.getElementById('search-btn').addEventListener('click', function() {
+                searchServers();
+            });
+            
+            // 重置搜索按钮事件
+            document.getElementById('reset-search-btn').addEventListener('click', function() {
+                document.getElementById('search-input').value = '';
+                loadServerList();
+            });
+            
+            // 回车键触发搜索
+            document.getElementById('search-input').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    searchServers();
+                }
+            });
+        });
+        
+        // 加载服务器列表
+        function loadServerList() {
+            fetch('/api/ssh-servers')
+                .then(response => response.json())
+                .then(data => {
+                    displayServerList(data);
+                })
+                .catch(error => {
+                    console.error('加载服务器列表失败:', error);
+                    alert('加载服务器列表失败: ' + error.message);
+                });
+        }
+        
+        // 显示服务器列表
+        function displayServerList(servers) {
+            const tableBody = document.getElementById('server-list-body');
+            tableBody.innerHTML = '';
+            
+            if (servers.length === 0) {
+                const row = document.createElement('tr');
+                const cell = document.createElement('td');
+                cell.colSpan = 6;
+                cell.textContent = '没有找到服务器配置';
+                cell.style.textAlign = 'center';
+                row.appendChild(cell);
+                tableBody.appendChild(row);
+                return;
+            }
+            
+            servers.forEach(server => {
+                const row = document.createElement('tr');
+                // 创建单元格
+                const nameCell = document.createElement('td');
+                nameCell.textContent = server.name;
+                row.appendChild(nameCell);
+                
+                const hostCell = document.createElement('td');
+                hostCell.textContent = server.host;
+                row.appendChild(hostCell);
+                
+                const portCell = document.createElement('td');
+                portCell.textContent = server.port;
+                row.appendChild(portCell);
+                
+                const usernameCell = document.createElement('td');
+                usernameCell.textContent = server.username;
+                row.appendChild(usernameCell);
+                
+                const descriptionCell = document.createElement('td');
+                descriptionCell.textContent = server.description || '';
+                row.appendChild(descriptionCell);
+                
+                // 操作按钮
+                const actionCell = document.createElement('td');
+                const actionDiv = document.createElement('div');
+                actionDiv.className = 'action-buttons';
+                
+                // 编辑按钮
+                const editBtn = document.createElement('button');
+                editBtn.className = 'btn btn-edit';
+                editBtn.textContent = '编辑';
+                editBtn.onclick = function() {
+                    editServer(server);
+                };
+                actionDiv.appendChild(editBtn);
+                
+                // 删除按钮
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'btn btn-delete';
+                deleteBtn.textContent = '删除';
+                deleteBtn.onclick = function() {
+                    deleteServer(server.id);
+                };
+                actionDiv.appendChild(deleteBtn);
+                
+                actionCell.appendChild(actionDiv);
+                row.appendChild(actionCell);
+                
+                tableBody.appendChild(row);
+            });
+        }
+        
+        // 保存服务器配置
+        function saveServerConfig() {
+            const serverId = document.getElementById('server-id').value;
+            const serverName = document.getElementById('server-name').value;
+            const serverHost = document.getElementById('server-host').value;
+            const serverPort = document.getElementById('server-port').value;
+            const serverUsername = document.getElementById('server-username').value;
+            const serverPassword = document.getElementById('server-password').value;
+            const serverDescription = document.getElementById('server-description').value;
+            
+            const serverConfig = {
+                name: serverName,
+                host: serverHost,
+                port: parseInt(serverPort),
+                username: serverUsername,
+                password: serverPassword,
+                description: serverDescription
+            };
+            
+            let url = '/api/ssh-servers';
+            let method = 'POST';
+            
+            // 如果是编辑现有配置
+            if (serverId) {
+                url = `/api/ssh-servers/${serverId}`;
+                method = 'PUT';
+                serverConfig.id = serverId;
+            }
+            
+            fetch(url, {
+                method: method,
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(serverConfig)
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('保存失败，状态码: ' + response.status);
+                }
+                return response.json();
+            })
+            .then(data => {
+                alert(serverId ? '服务器配置已更新' : '服务器配置已添加');
+                resetForm();
+                loadServerList();
+            })
+            .catch(error => {
+                console.error('保存服务器配置失败:', error);
+                alert('保存服务器配置失败: ' + error.message);
+            });
+        }
+        
+        // 编辑服务器配置
+        function editServer(server) {
+            document.getElementById('form-title').textContent = '编辑服务器';
+            document.getElementById('server-id').value = server.id;
+            document.getElementById('server-name').value = server.name;
+            document.getElementById('server-host').value = server.host;
+            document.getElementById('server-port').value = server.port;
+            document.getElementById('server-username').value = server.username;
+            document.getElementById('server-password').value = server.password;
+            document.getElementById('server-description').value = server.description || '';
+            
+            // 滚动到表单
+            document.getElementById('config-form').scrollIntoView({ behavior: 'smooth' });
+            
+            currentEditId = server.id;
+        }
+        
+        // 删除服务器配置
+        function deleteServer(id) {
+            if (confirm('确定要删除这个服务器配置吗？')) {
+                fetch(`/api/ssh-servers/${id}`, {
+                    method: 'DELETE'
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('删除失败，状态码: ' + response.status);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (data.success) {
+                        alert('服务器配置已删除');
+                        loadServerList();
+                    } else {
+                        alert('删除服务器配置失败');
+                    }
+                })
+                .catch(error => {
+                    console.error('删除服务器配置失败:', error);
+                    alert('删除服务器配置失败: ' + error.message);
+                });
+            }
+        }
+        
+        // 重置表单
+        function resetForm() {
+            document.getElementById('form-title').textContent = '添加新服务器';
+            document.getElementById('server-form').reset();
+            document.getElementById('server-id').value = '';
+            currentEditId = null;
+        }
+        
+        // 搜索服务器
+        function searchServers() {
+            const keyword = document.getElementById('search-input').value.trim();
+            
+            if (keyword === '') {
+                loadServerList();
+                return;
+            }
+            
+            fetch(`/api/ssh-servers/search?keyword=${encodeURIComponent(keyword)}`)
+                .then(response => response.json())
+                .then(data => {
+                    displayServerList(data);
+                })
+                .catch(error => {
+                    console.error('搜索服务器失败:', error);
+                    alert('搜索服务器失败: ' + error.message);
+                });
+        }
+    </script>
+</body>
+</html>

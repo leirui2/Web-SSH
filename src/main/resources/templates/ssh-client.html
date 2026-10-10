@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <title>SSH客户端</title>
+    <link rel="stylesheet" href="/css/xterm.css" />
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        /* 终端按键栏样式 */
+        .terminal-keybar {
+            margin-top: 10px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background-color: #f9f9f9;
+        }
+        .keybar-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .key-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .key-button {
+            padding: 6px 12px;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        /* 按键编辑对话框样式 */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.4);
+        }
+        .modal-content {
+            background-color: #fefefe;
+            margin: 10% auto;
+            padding: 20px;
+            border: 1px solid #888;
+            width: 50%;
+            border-radius: 5px;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .modal-header h2 {
+            margin: 0;
+        }
+        .close {
+            color: #aaa;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .close:hover {
+            color: black;
+        }
+        .form-row {
+            margin-bottom: 15px;
+        }
+        .form-row label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        .form-row input, .form-row textarea, .form-row select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+        }
+        .form-row textarea {
+            height: 100px;
+            resize: vertical;
+        }
+        .button-row {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .connection-form {
+            background-color: #fff;
+            padding: 12px 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            flex-wrap: wrap;
+            min-height: auto;
+        }
+        .form-group {
+            margin-bottom: 0;
+            display: flex;
+            align-items: center;
+            margin: 4px 0;
+        }
+        .form-group label {
+            display: inline-block;
+            width: 80px;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        .form-group input {
+            width: 180px;
+            padding: 4px 6px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            font-size: 14px;
+        }
+        .btn {
+            padding: 6px 12px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            margin-right: 8px;
+            font-size: 14px;
+            white-space: nowrap;
+        }
+        .btn:hover {
+            background-color: #45a049;
+        }
+        .btn-disconnect {
+            background-color: #f44336;
+        }
+        .btn-disconnect:hover {
+            background-color: #da190b;
+        }
+        .terminal-container {
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            position: relative;
+        }
+        #terminal {
+            width: 100%;
+            height: 500px;
+            background-color: #000;
+        }
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 3px;
+            background-color: #f0f0f0;
+        }
+        .status-connected {
+            color: green;
+        }
+        .status-disconnected {
+            color: red;
+        }
+        /* SFTP相关样式 */
+        .sftp-controls {
+            margin-top: 15px;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background-color: #f9f9f9;
+        }
+        #file-list {
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 10px;
+            margin: 10px 0;
+            background-color: #fff;
+        }
+        #file-list table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        #file-list th {
+            text-align: left;
+            padding: 5px;
+            border-bottom: 2px solid #ddd;
+        }
+        #file-list td {
+            padding: 5px;
+            border-bottom: 1px solid #eee;
+        }
+        #file-list tr:hover {
+            background-color: #f1f1f1;
+            cursor: pointer;
+        }
+        /* 终端：允许从框内直接用鼠标拖拽选择（覆盖 xterm 默认的 user-select:none），并让选区可见 */
+        #terminal .xterm,
+        #terminal .xterm * {
+            user-select: text !important;
+            -ms-user-select: text !important;
+            -webkit-user-select: text !important;
+        }
+        #terminal .xterm ::selection,
+        #terminal .xterm *::selection {
+            background: #3a6ea5 !important;
+            color: #ffffff !important;
+        }
+        #terminal .xterm .xterm-accessibility-tree:not(.debug) *::selection {
+            background: #3a6ea5 !important;
+            color: #ffffff !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="connection-form">
+            <div class="server-selection">
+                <label for="server-select">选择服务器：</label>
+                <select id="server-select" style="padding: 4px 6px; border: 1px solid #ddd; border-radius: 3px; margin-right: 10px;">
+                    <option value="">-- 手动输入 --</option>
+                    <!-- 服务器选项将通过JavaScript动态添加 -->
+                </select>
+                <a href="/ssh-server-config" class="btn" style="font-size: 12px; padding: 4px 8px;">管理服务器</a>
+            </div>
+            <div class="form-group">
+                <label for="host">主机：</label>
+                <input type="text" id="host" placeholder="192.168.1.1" value="192.168.56.100">
+            </div>
+            <div class="form-group">
+                <label for="port">端口：</label>
+                <input type="text" id="port" placeholder="22" value="22">
+            </div>
+            <div class="form-group">
+                <label for="username">用户名：</label>
+                <input type="text" id="username" placeholder="user" value="ares">
+            </div>
+            <div class="form-group">
+                <label for="password">密码：</label>
+                <input type="password" id="password" placeholder="password" value="123">
+            </div>
+            <div class="form-group">
+                <label for="auth-method">认证方式：</label>
+                <select id="auth-method" style="padding: 4px 6px; border: 1px solid #ddd; border-radius: 3px;">
+                    <option value="password">密码认证</option>
+                    <option value="privatekey">私钥认证</option>
+                </select>
+            </div>
+            <div id="private-key-container" style="display: none;">
+                <div class="form-group">
+                    <label for="private-key">私钥：</label>
+                    <textarea id="private-key" rows="5" style="width: 100%; padding: 5px;" placeholder="粘贴私钥内容或选择私钥文件"></textarea>
+                    <input type="file" id="private-key-file" accept=".pem,.key,.ppk" style="margin-top: 5px;">
+                </div>
+                <div class="form-group">
+                    <label for="passphrase">私钥密码(可选)：</label>
+                    <input type="password" id="passphrase" placeholder="私钥密码">
+                </div>
+            </div>
+            <button id="connect-btn" class="btn">连接</button>
+            <button id="disconnect-btn" class="btn btn-disconnect" disabled>断开连接</button>
+        </div>
+        
+        <div class="terminal-container">
+            <div id="terminal"></div>
+            <div style="margin-top:8px;">
+                <span style="font-size:12px;color:#888;">可鼠标拖拽选择（选中自动复制）；Ctrl+Shift+C 复制 / Ctrl+Shift+V 粘贴</span>
+            </div>
+            <div id="status" class="status status-disconnected">未连接</div>
+            
+            <!-- 终端按键栏 -->
+            <div id="terminal-keybar" class="terminal-keybar" style="display: none;">
+                <div class="keybar-header">
+                    <select id="key-group-select" style="padding: 4px 6px; border: 1px solid #ddd; border-radius: 3px; margin-right: 10px;">
+                        <!-- 按键组选项将通过JavaScript动态添加 -->
+                    </select>
+                    <button id="add-key-btn" class="btn" style="font-size: 12px; padding: 4px 8px;">添加按键</button>
+                    <button id="edit-group-btn" class="btn" style="font-size: 12px; padding: 4px 8px;">编辑组</button>
+                    <button id="add-group-btn" class="btn" style="font-size: 12px; padding: 4px 8px;">新建组</button>
+                </div>
+                <div id="key-buttons" class="key-buttons">
+                    <!-- 按键按钮将通过JavaScript动态添加 -->
+                </div>
+            </div>
+            
+            <!-- SFTP操作区域 -->
+            <div id="sftp-controls" class="sftp-controls" style="display: none;">
+                <div style="margin-bottom: 10px;">
+                    <input type="text" id="remote-path" placeholder="远程路径 (例如: /home/user)" value="/home" style="width: 300px; padding: 5px;">
+                    <button id="list-files-btn" class="btn" style="margin-left: 10px;">列出文件</button>
+                    <button id="parent-dir-btn" class="btn" style="margin-left: 10px;">返回上一级</button>
+                </div>
+                <div id="file-list" style="max-height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px;">
+                    <!-- 文件列表将在这里显示 -->
+                </div>
+                <div>
+                    <input type="file" id="file-upload" style="display: none;">
+                    <button id="upload-btn" class="btn">上传文件</button>
+                    <input type="text" id="local-file-path" placeholder="本地文件路径" style="width: 200px; padding: 5px; margin-left: 10px;">
+                    <button id="download-btn" class="btn" style="margin-left: 10px;">下载文件</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/xterm.js"></script>
+    <script src="/js/xterm-addon-fit.js"></script>
+    <script src="/js/ssh-client.js"></script>
+    
+    <!-- 按键编辑对话框 -->
+    <div id="key-edit-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="key-edit-title">编辑按键</h2>
+                <span class="close">&times;</span>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="key-edit-id">
+                <div class="form-row">
+                    <label for="key-edit-label">按键标签</label>
+                    <input type="text" id="key-edit-label" placeholder="显示在按钮上的文字">
+                </div>
+                <div class="form-row">
+                    <label for="key-edit-command">按键命令</label>
+                    <textarea id="key-edit-command" placeholder="按下按钮时发送到终端的命令"></textarea>
+                </div>
+                <div class="form-row">
+                    <label for="key-edit-color">按键颜色</label>
+                    <input type="color" id="key-edit-color" value="#4CAF50">
+                </div>
+                <div class="button-row">
+                    <button id="key-delete-btn" class="btn btn-disconnect">删除</button>
+                    <button id="key-save-btn" class="btn">保存</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 按键组编辑对话框 -->
+    <div id="group-edit-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="group-edit-title">编辑按键组</h2>
+                <span class="close">&times;</span>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="group-edit-id">
+                <div class="form-row">
+                    <label for="group-edit-name">按键组名称</label>
+                    <input type="text" id="group-edit-name" placeholder="按键组名称">
+                </div>
+                <div class="form-row">
+                    <label>按键列表</label>
+                    <div id="group-keys-list" style="border: 1px solid #ddd; padding: 10px; max-height: 200px; overflow-y: auto;">
+                        <!-- 按键列表将通过JavaScript动态添加 -->
+                    </div>
+                </div>
+                <div class="button-row">
+                    <button id="group-delete-btn" class="btn btn-disconnect">删除</button>
+                    <button id="group-save-btn" class="btn">保存</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
