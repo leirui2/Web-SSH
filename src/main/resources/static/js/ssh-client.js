@@ -205,20 +205,15 @@ function listRemoteFiles() {
 
 // 处理文件上传
 function handleFileUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    
     if (!socket || socket.readyState !== WebSocket.OPEN) {
         alert('请先连接到SSH服务器');
         return;
     }
     
-    const file = event.target.files[0];
-    if (!file) return;
-    
-    // 检查文件大小，调整分片大小
-    const MAX_CHUNK_SIZE = 2 * 1024 * 1024; // 2MB分片大小，提高上传速度
-    const PARALLEL_UPLOADS = 3; // 并行上传数
-    
     const remotePath = document.getElementById('remote-path').value || '/';
-    const remoteFileName = file.name;
     
     // 创建进度显示元素
     const progressDiv = document.createElement('div');
@@ -229,157 +224,100 @@ function handleFileUpload(event) {
                                 <div id="progress-bar" style="width:0%; background:#4CAF50; height:20px;"></div>
                             </div>`;
     
-    // 添加到页面
     const sftpControls = document.getElementById('sftp-controls');
-    // 移除可能存在的旧进度条
     const oldProgress = document.getElementById('upload-progress');
-    if (oldProgress) {
-        oldProgress.remove();
-    }
+    if (oldProgress) oldProgress.remove();
     sftpControls.appendChild(progressDiv);
+    
+    // 保存文件信息，等待 sftp_upload_ready 响应后开始流式上传
+    window.pendingUploadFile = file;
+    window.pendingUploadRemotePath = remotePath;
+    
+    // 发送上传请求（仅元数据，不含文件数据）
+    const msg = JSON.stringify({
+        type: 'sftp_upload',
+        remotePath: remotePath,
+        fileName: file.name,
+        fileSize: file.size
+    });
+    socket.send(msg);
+    document.getElementById('progress-text').textContent = '等待服务器响应...';
+    
+    document.getElementById('file-upload').value = '';
+}
+
+// 流式分片上传（支持断点续传 + 背压控制）
+function startStreamingUpload(file, remotePath, offset, resumeUpload) {
+    const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
+    const remainingSize = file.size - offset;
+    const totalChunks = Math.ceil(remainingSize / CHUNK_SIZE);
+    let chunkIndex = 0;
+    let sentBytes = 0;
     
     const progressText = document.getElementById('progress-text');
     const progressBar = document.getElementById('progress-bar');
     
-    // 更新进度的函数
-    const updateProgress = (current, total) => {
-        const percent = Math.round((current / total) * 100);
-        progressText.textContent = `${percent}% (${current}/${total})`;
-        progressBar.style.width = `${percent}%`;
-    };
-    
-    // 发送上传请求
-    try {
-        const msg = JSON.stringify({
-            type: 'sftp_upload',
-            remotePath: remotePath,
-            fileName: remoteFileName,
-            fileSize: file.size
-        });
-        socket.send(msg);
-        progressText.textContent = '服务器准备中...';
-    } catch (e) {
-        console.error('发送上传请求失败:', e);
-        progressText.textContent = '上传请求失败: ' + e.message;
-        return;
-    }
-    
-    // 读取文件并发送数据
-    const reader = new FileReader();
-    reader.onload = function(e) {
-        try {
-            const fileData = e.target.result;
-            const fileArray = new Uint8Array(fileData);
+    const sendChunk = () => {
+        if (chunkIndex >= totalChunks) {
+            progressText.textContent = '所有分片已发送，等待服务器处理...';
+            return;
+        }
+        
+        if (socket.readyState !== WebSocket.OPEN) {
+            progressText.textContent = 'WebSocket连接已关闭，上传中断';
+            return;
+        }
+        
+        // 背压控制：WebSocket 发送缓冲区过大时等待
+        if (socket.bufferedAmount > 4 * 1024 * 1024) {
+            setTimeout(sendChunk, 50);
+            return;
+        }
+        
+        const start = offset + chunkIndex * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const isLast = chunkIndex === totalChunks - 1;
+        
+        // 用 file.slice 流式读取，不加载整个文件到内存
+        const chunkBlob = file.slice(start, end);
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const chunkData = e.target.result;
             
-            // 如果文件小于分片大小，直接发送
-            if (fileArray.length <= MAX_CHUNK_SIZE) {
-                progressText.textContent = '正在上传小文件...';
-                
-                // 等待服务器准备就绪后发送文件数据
-                setTimeout(() => {
-                    try {
-                        // 直接发送二进制数据
-                        const dataMsg = {
-                            type: 'sftp_data',
-                            fileName: remoteFileName,
-                            remotePath: remotePath,
-                            isLastChunk: true,
-                            binaryTransfer: true
-                        };
-                        
-                        // 先发送元数据
-                        socket.send(JSON.stringify(dataMsg));
-                        
-                        // 然后直接发送二进制数据
-                        socket.send(fileArray.buffer);
-                        progressText.textContent = '文件已发送，等待服务器处理...';
-                        console.log('文件上传请求已发送');
-                    } catch (e) {
-                        console.error('发送文件数据失败:', e);
-                        progressText.textContent = '上传失败: ' + e.message;
-                    }
-                }, 500);
-            } else {
-                // 大文件分片上传
-                const totalChunks = Math.ceil(fileArray.length / MAX_CHUNK_SIZE);
-                console.log(`文件大小: ${fileArray.length} 字节, 分为 ${totalChunks} 个分片上传`);
-                progressText.textContent = `准备分片上传，共 ${totalChunks} 个分片`;
-                
-                // 分片上传函数
-                const uploadChunk = (chunkIndex) => {
-                    if (chunkIndex >= totalChunks) {
-                        console.log('所有分片上传完成');
-                        progressText.textContent = '所有分片已发送，等待服务器处理...';
-                        return;
-                    }
-                    
-                    if (socket.readyState !== WebSocket.OPEN) {
-                        console.error('WebSocket连接已关闭，无法继续上传');
-                        progressText.textContent = 'WebSocket连接已关闭，上传中断';
-                        return;
-                    }
-                    
-                    const start = chunkIndex * MAX_CHUNK_SIZE;
-                    const end = Math.min(start + MAX_CHUNK_SIZE, fileArray.length);
-                    const chunk = fileArray.slice(start, end);
-                    
-                    try {
-                        // 直接发送二进制数据
-                        const dataMsg = {
-                            type: 'sftp_data',
-                            fileName: remoteFileName,
-                            remotePath: remotePath,
-                            chunkIndex: chunkIndex,
-                            totalChunks: totalChunks,
-                            isLastChunk: (chunkIndex === totalChunks - 1),
-                            binaryTransfer: true
-                        };
-                        
-                        // 先发送元数据
-                        socket.send(JSON.stringify(dataMsg));
-                        
-                        // 然后直接发送二进制数据块
-                        socket.send(chunk.buffer);
-                        updateProgress(chunkIndex + 1, totalChunks);
-                        console.log(`已发送分片 ${chunkIndex + 1}/${totalChunks}`);
-                        
-                        // 增加延迟时间，给服务器更多处理时间
-                        setTimeout(() => {
-                            uploadChunk(chunkIndex + 1);
-                        }, 500);
-                    } catch (e) {
-                        console.error(`分片 ${chunkIndex + 1} 上传失败:`, e);
-                        progressText.textContent = `分片 ${chunkIndex + 1} 上传失败: ${e.message}`;
-                    }
-                };
-                
-                // 开始上传第一个分片
-                setTimeout(() => {
-                    uploadChunk(0);
-                }, 500);
-            }
-        } catch (e) {
-            console.error('处理文件数据失败:', e);
-            progressText.textContent = '处理文件数据失败: ' + e.message;
-        }
+            // 发送元数据
+            const dataMsg = {
+                type: 'sftp_data',
+                fileName: file.name,
+                remotePath: remotePath,
+                chunkIndex: chunkIndex,
+                totalChunks: totalChunks,
+                isLastChunk: isLast,
+                binaryTransfer: true,
+                resumeUpload: resumeUpload
+            };
+            socket.send(JSON.stringify(dataMsg));
+            
+            // 发送二进制数据
+            socket.send(chunkData);
+            
+            sentBytes += (end - start);
+            const percent = Math.round((sentBytes / remainingSize) * 100);
+            const sentMB = (sentBytes / 1024 / 1024).toFixed(1);
+            const totalMB = (remainingSize / 1024 / 1024).toFixed(1);
+            const tag = resumeUpload ? ' [续传]' : '';
+            progressText.textContent = `${percent}% (${sentMB}MB / ${totalMB}MB)${tag}`;
+            progressBar.style.width = `${percent}%`;
+            
+            chunkIndex++;
+            sendChunk();
+        };
+        reader.onerror = (e) => {
+            progressText.textContent = `读取分片失败: ${e.target.error}`;
+        };
+        reader.readAsArrayBuffer(chunkBlob);
     };
     
-    reader.onerror = function(e) {
-        console.error('读取文件失败:', e);
-        if (progressText) {
-            progressText.textContent = '读取文件失败: ' + e.target.error;
-        }
-    };
-    
-    try {
-        reader.readAsArrayBuffer(file);
-    } catch (e) {
-        console.error('启动文件读取失败:', e);
-        progressText.textContent = '启动文件读取失败: ' + e.message;
-    }
-    
-    // 清空文件选择器，允许重复选择同一文件
-    document.getElementById('file-upload').value = '';
+    sendChunk();
 }
 
 // 下载文件
@@ -1236,12 +1174,8 @@ function connect() {
         // WebSocket连接事件
         socket.onopen = () => {
             console.log('WebSocket连接已建立');
-            document.getElementById('status').innerHTML = '已连接到 ' + host;
-            document.getElementById('status').className = 'status status-connected';
-            document.getElementById('connect-btn').disabled = true;
-            document.getElementById('disconnect-btn').disabled = false;
-            document.getElementById('sftp-controls').style.display = 'block';
-            document.getElementById('terminal-keybar').style.display = 'block';
+            document.getElementById('status').innerHTML = '连接中...';
+            document.getElementById('status').className = 'status status-disconnected';
             
             // 发送连接请求
             const connectMsg = JSON.stringify({
@@ -1327,8 +1261,29 @@ function connect() {
                     
                     // 根据消息类型处理
                     switch (msg.type) {
+                        case 'connect':
+                            if (msg.status === 'success') {
+                                const host = document.getElementById('host').value;
+                                document.getElementById('status').innerHTML = '已连接到 ' + host;
+                                document.getElementById('status').className = 'status status-connected';
+                                document.getElementById('connect-btn').disabled = true;
+                                document.getElementById('disconnect-btn').disabled = false;
+                                document.getElementById('sftp-controls').style.display = 'block';
+                                document.getElementById('terminal-keybar').style.display = 'block';
+                            }
+                            break;
                         case 'error':
                             term.write("\r\n[ERROR] " + msg.message + "\r\n");
+                            // 连接失败时重置 UI
+                            if (document.getElementById('connect-btn').disabled) {
+                                document.getElementById('connect-btn').disabled = false;
+                                document.getElementById('disconnect-btn').disabled = true;
+                            }
+                            document.getElementById('status').innerHTML = '连接失败';
+                            document.getElementById('status').className = 'status status-disconnected';
+                            document.getElementById('sftp-controls').style.display = 'none';
+                            document.getElementById('terminal-keybar').style.display = 'none';
+                            if (socket) { socket.close(); socket = null; }
                             break;
                         case 'disconnect':
                             disconnect();
@@ -1346,9 +1301,52 @@ function connect() {
                             // 显示文件列表
                             displayFileList(msg.files);
                             break;
+                        case 'sftp_upload_ready':
+                            {
+                                const file = window.pendingUploadFile;
+                                const remotePath = window.pendingUploadRemotePath;
+                                if (!file) { console.error('没有待上传的文件'); break; }
+                                
+                                const remoteExistingSize = msg.remoteExistingSize || 0;
+                                let offset = 0;
+                                let resumeUpload = false;
+                                
+                                if (remoteExistingSize > 0 && remoteExistingSize < file.size) {
+                                    if (confirm(`远程文件已存在 ${(remoteExistingSize/1024/1024).toFixed(1)}MB，本地文件 ${(file.size/1024/1024).toFixed(1)}MB。\n是否断点续传？`)) {
+                                        offset = remoteExistingSize;
+                                        resumeUpload = true;
+                                    }
+                                } else if (remoteExistingSize === file.size && file.size > 0) {
+                                    if (!confirm(`远程文件已存在且大小相同 (${(file.size/1024/1024).toFixed(1)}MB)。\n是否重新上传覆盖？`)) {
+                                        window.pendingUploadFile = null;
+                                        const pt = document.getElementById('progress-text');
+                                        if (pt) pt.textContent = '已取消';
+                                        break;
+                                    }
+                                } else if (remoteExistingSize > file.size) {
+                                    if (!confirm(`远程文件 (${(remoteExistingSize/1024/1024).toFixed(1)}MB) 比本地文件 (${(file.size/1024/1024).toFixed(1)}MB) 大。\n是否重新上传覆盖？`)) {
+                                        window.pendingUploadFile = null;
+                                        const pt = document.getElementById('progress-text');
+                                        if (pt) pt.textContent = '已取消';
+                                        break;
+                                    }
+                                }
+                                
+                                startStreamingUpload(file, remotePath, offset, resumeUpload);
+                            }
+                            break;
+                        case 'sftp_chunk_received':
+                            // 分片确认，流式上传中不需要处理（背压由 bufferedAmount 控制）
+                            break;
                         case 'sftp_upload_result':
                             if (msg.success) {
+                                window.pendingUploadFile = null;
+                                const pt = document.getElementById('progress-text');
+                                const pb = document.getElementById('progress-bar');
+                                if (pt) pt.textContent = '上传完成 ✓';
+                                if (pb) pb.style.width = '100%';
                                 let alertMsg = '文件上传成功: ' + msg.fileName;
+                                if (msg.resumed) alertMsg += ' (断点续传)';
                                 if (msg.localMd5 && msg.remoteMd5) {
                                     alertMsg += '\n\n本地 MD5:  ' + msg.localMd5;
                                     alertMsg += '\n远程 MD5:  ' + msg.remoteMd5;
@@ -1356,6 +1354,8 @@ function connect() {
                                 }
                                 alert(alertMsg);
                             } else {
+                                const pt = document.getElementById('progress-text');
+                                if (pt) pt.textContent = '上传失败: ' + (msg.error || '未知错误');
                                 alert('文件上传失败: ' + (msg.error || '未知错误'));
                             }
                             break;

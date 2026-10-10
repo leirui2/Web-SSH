@@ -91,6 +91,18 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
             sftpChannel.disconnect();
         }
         
+        // 清理临时上传文件和 SFTP 上传流
+        for (String key : tempUploadFiles.keySet()) {
+            if (key.startsWith(sessionId + "_")) {
+                cleanupTempUpload(key);
+            }
+        }
+        for (String key : sftpUploadStreams.keySet()) {
+            if (key.startsWith(sessionId + "_")) {
+                cleanupTempUpload(key);
+            }
+        }
+        
         disconnectSSH(sessionId); // 确保SSH资源被正确释放
         System.out.println("WebSocket connection closed, sessionId: " + sessionId);
     }
@@ -126,7 +138,7 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
         }
     }
     
-    // 处理二进制上传数据
+    // 处理二进制上传数据（流式直写远程 + 增量 MD5，无需临时文件）
     private void handleBinaryUpload(WebSocketSession session, BinaryMessage message, Map<String, Object> uploadInfo) {
         String sessionId = session.getId();
         String fileName = (String) uploadInfo.get("fileName");
@@ -134,103 +146,36 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
         boolean isLastChunk = (boolean) uploadInfo.get("isLastChunk");
         Integer chunkIndex = (Integer) uploadInfo.get("chunkIndex");
         Integer totalChunks = (Integer) uploadInfo.get("totalChunks");
+        boolean resumeUpload = uploadInfo.containsKey("resumeUpload") && (boolean) uploadInfo.get("resumeUpload");
+        
+        String uploadKey = sessionId + "_" + fileName;
+        boolean success = false;
         
         try {
-            // 获取二进制数据
             byte[] fileData = message.getPayload().array();
             
-            // 创建唯一的上传标识符
-            String uploadKey = sessionId + "_" + fileName;
-            
-            // 如果是分片上传且不是最后一个分片，则存储分片数据
-            if (totalChunks != null && totalChunks > 1 && !isLastChunk) {
-                try {
-                    ByteArrayOutputStream outputStream = chunkUploads.computeIfAbsent(uploadKey, 
-                            k -> new ByteArrayOutputStream(1024 * 1024)); // 预分配1MB缓冲区
-                    outputStream.write(fileData);
-                    
-                    // 更新进度信息
-                    chunkProgress.put(uploadKey, chunkIndex + 1);
-                    
-                    // 发送分片接收确认
-                    Map<String, Object> response = new HashMap<>();
-                    response.put("type", "sftp_chunk_received");
-                    response.put("fileName", fileName);
-                    response.put("chunkIndex", chunkIndex);
-                    response.put("totalChunks", totalChunks);
-                    response.put("progress", String.format("%.1f%%", (chunkIndex + 1) * 100.0 / totalChunks));
-                    
-                    try {
-                        send(session, new TextMessage(mapper.writeValueAsString(response)));
-                    } catch (IOException e) {
-                        System.err.println("发送分片确认失败: " + e.getMessage());
-                    }
-                    
-                    // 清除待处理标记
-                    pendingBinaryUploads.remove(sessionId);
-                    return; // 等待接收所有分片
-                } catch (OutOfMemoryError e) {
-                    // 内存不足，清理临时数据
-                    chunkUploads.remove(uploadKey);
-                    chunkProgress.remove(uploadKey);
-                    pendingBinaryUploads.remove(sessionId);
-                    sendErrorMessage(session, "服务器内存不足，无法处理此文件: " + e.getMessage());
-                    return;
-                }
-            }
-            
-            // 如果是分片上传的最后一个分片，合并所有分片
-            if (totalChunks != null && totalChunks > 1 && isLastChunk) {
-                ByteArrayOutputStream outputStream = chunkUploads.get(uploadKey);
-                if (outputStream != null) {
-                    try {
-                        outputStream.write(fileData);
-                        fileData = outputStream.toByteArray();
-                    } catch (OutOfMemoryError e) {
-                        // 内存不足，清理临时数据
-                        chunkUploads.remove(uploadKey);
-                        chunkProgress.remove(uploadKey);
-                        pendingBinaryUploads.remove(sessionId);
-                        sendErrorMessage(session, "合并分片时内存不足: " + e.getMessage());
-                        return;
-                    } finally {
-                        // 清理临时数据
-                        chunkUploads.remove(uploadKey);
-                        chunkProgress.remove(uploadKey);
-                    }
-                }
-            }
-            
-            // 获取或创建SFTP通道
-            ChannelSftp channel = getSFTPChannel(sessionId);
-            if (channel == null) {
-                pendingBinaryUploads.remove(sessionId);
-                sendErrorMessage(session, "SFTP通道创建失败");
-                return;
-            }
-            
-            // 确保路径以/结尾
             if (!remotePath.endsWith("/")) {
                 remotePath += "/";
             }
-            
-            // 上传文件
-            ByteArrayInputStream inputStream = new ByteArrayInputStream(fileData);
             String remoteFilePath = remotePath + fileName;
             
-            try {
-                // 发送上传开始消息
-                Map<String, Object> startResponse = new HashMap<>();
-                startResponse.put("type", "sftp_upload_start");
-                startResponse.put("fileName", fileName);
-                send(session, new TextMessage(mapper.writeValueAsString(startResponse)));
+            // 获取或创建 SFTP 输出流（第一个分片时创建）
+            OutputStream sftpOut = sftpUploadStreams.get(uploadKey);
+            java.security.MessageDigest md5Digest = uploadMd5Digests.get(uploadKey);
+            
+            if (sftpOut == null) {
+                ChannelSftp channel = getSFTPChannel(sessionId);
+                if (channel == null) {
+                    pendingBinaryUploads.remove(sessionId);
+                    sendErrorMessage(session, "SFTP通道创建失败");
+                    return;
+                }
                 
-                // 尝试切换到目标目录，如果不存在则创建
+                // 确保远程目录存在
                 try {
                     channel.cd(remotePath);
                 } catch (SftpException e) {
                     if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) {
-                        // 目录不存在，尝试创建
                         createDirectoryRecursively(channel, remotePath);
                         channel.cd(remotePath);
                     } else {
@@ -238,56 +183,92 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
                     }
                 }
                 
-                // 上传文件到当前目录
-                channel.put(inputStream, fileName);
+                // 发送上传开始消息
+                Map<String, Object> startResponse = new HashMap<>();
+                startResponse.put("type", "sftp_upload_start");
+                startResponse.put("fileName", fileName);
+                send(session, new TextMessage(mapper.writeValueAsString(startResponse)));
                 
-                // 计算 MD5 校验
-                String localMd5 = calculateMD5(fileData);
+                // 创建 SFTP 输出流：新上传 OVERWRITE，续传 APPEND
+                int mode = resumeUpload ? ChannelSftp.APPEND : ChannelSftp.OVERWRITE;
+                sftpOut = channel.put(fileName, mode);
+                sftpUploadStreams.put(uploadKey, sftpOut);
+                
+                // 创建 MD5 增量摘要
+                md5Digest = java.security.MessageDigest.getInstance("MD5");
+                uploadMd5Digests.put(uploadKey, md5Digest);
+                
+                // 续传时：先读取远程已有部分更新 MD5 摘要，使本地 MD5 覆盖整个文件
+                if (resumeUpload) {
+                    long existingSize = 0;
+                    try {
+                        SftpATTRS attrs = channel.stat(remoteFilePath);
+                        existingSize = attrs.getSize();
+                    } catch (SftpException e) { }
+                    if (existingSize > 0) {
+                        System.out.println("续传: 读取远程已有部分 " + existingSize + " 字节用于 MD5 计算");
+                        try (InputStream remoteIn = channel.get(remoteFilePath)) {
+                            byte[] buffer = new byte[256 * 1024];
+                            int len;
+                            while ((len = remoteIn.read(buffer)) != -1) {
+                                md5Digest.update(buffer, 0, len);
+                            }
+                        }
+                    }
+                }
+                
+                System.out.println("开始流式上传到远程: " + remoteFilePath + " (模式: " + (resumeUpload ? "APPEND" : "OVERWRITE") + ")");
+            }
+            
+            // 直接写入远程文件 + 更新 MD5 摘要
+            sftpOut.write(fileData);
+            md5Digest.update(fileData);
+            
+            // 发送分片接收确认
+            Map<String, Object> chunkResponse = new HashMap<>();
+            chunkResponse.put("type", "sftp_chunk_received");
+            chunkResponse.put("fileName", fileName);
+            chunkResponse.put("chunkIndex", chunkIndex);
+            chunkResponse.put("totalChunks", totalChunks);
+            send(session, new TextMessage(mapper.writeValueAsString(chunkResponse)));
+            
+            // 最后一个分片：关闭流，计算 MD5 校验
+            if (isLastChunk) {
+                sftpOut.close();
+                sftpUploadStreams.remove(uploadKey);
+                uploadMd5Digests.remove(uploadKey);
+                
+                // 本地 MD5（从增量摘要）
+                byte[] digest = md5Digest.digest();
+                StringBuilder sb = new StringBuilder();
+                for (byte b : digest) {
+                    sb.append(String.format("%02x", b & 0xff));
+                }
+                String localMd5 = sb.toString();
+                
+                // 远程 MD5
+                ChannelSftp channel = getSFTPChannel(sessionId);
                 String remoteMd5 = calculateRemoteMD5(channel, remoteFilePath);
                 
-                // 发送上传成功消息
-                Map<String, Object> response = new HashMap<>();
-                response.put("type", "sftp_upload_result");
-                response.put("success", true);
-                response.put("fileName", fileName);
-                response.put("path", remoteFilePath);
-                response.put("localMd5", localMd5);
-                response.put("remoteMd5", remoteMd5);
-                response.put("md5Match", localMd5.equals(remoteMd5));
-                send(session, new TextMessage(mapper.writeValueAsString(response)));
+                Map<String, Object> resultResponse = new HashMap<>();
+                resultResponse.put("type", "sftp_upload_result");
+                resultResponse.put("success", true);
+                resultResponse.put("fileName", fileName);
+                resultResponse.put("path", remoteFilePath);
+                resultResponse.put("localMd5", localMd5);
+                resultResponse.put("remoteMd5", remoteMd5);
+                resultResponse.put("md5Match", localMd5.equals(remoteMd5));
+                resultResponse.put("resumed", resumeUpload);
+                send(session, new TextMessage(mapper.writeValueAsString(resultResponse)));
                 
-            } catch (SftpException e) {
-                try {
-                    // 如果切换目录失败，尝试直接使用完整路径上传
-                    channel.put(inputStream, remoteFilePath);
-                    
-                    // 计算 MD5 校验
-                    String localMd5 = calculateMD5(fileData);
-                    String remoteMd5 = calculateRemoteMD5(channel, remoteFilePath);
-                    
-                    // 发送上传成功消息
-                    Map<String, Object> response = new HashMap<>();
-                    response.put("type", "sftp_upload_result");
-                    response.put("success", true);
-                    response.put("fileName", fileName);
-                    response.put("path", remoteFilePath);
-                    response.put("localMd5", localMd5);
-                    response.put("remoteMd5", remoteMd5);
-                    response.put("md5Match", localMd5.equals(remoteMd5));
-                    send(session, new TextMessage(mapper.writeValueAsString(response)));
-                } catch (Exception ex) {
-                    throw ex; // 重新抛出异常，让外层catch处理
-                }
+                System.out.println("上传完成: " + remoteFilePath + " 本地MD5=" + localMd5 + " 远程MD5=" + remoteMd5);
             }
+            
+            success = true;
             
         } catch (Exception e) {
             e.printStackTrace();
             try {
-                // 清理可能存在的临时数据
-                String uploadKey = sessionId + "_" + fileName;
-                chunkUploads.remove(uploadKey);
-                chunkProgress.remove(uploadKey);
-                
                 Map<String, Object> response = new HashMap<>();
                 response.put("type", "sftp_upload_result");
                 response.put("success", false);
@@ -297,8 +278,30 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
                 ex.printStackTrace();
             }
         } finally {
-            // 清除待处理标记
+            // 非最后分片且成功：保持流开启，等待下一片
+            // 最后分片或出错：清理资源
+            if (isLastChunk || !success) {
+                cleanupTempUpload(uploadKey);
+                chunkProgress.remove(uploadKey);
+            }
             pendingBinaryUploads.remove(sessionId);
+        }
+    }
+    
+    // 清理临时上传资源（SFTP 流 + MD5 摘要 + 临时文件）
+    private void cleanupTempUpload(String uploadKey) {
+        OutputStream sftpOut = sftpUploadStreams.remove(uploadKey);
+        if (sftpOut != null) {
+            try { sftpOut.close(); } catch (IOException e) {}
+        }
+        uploadMd5Digests.remove(uploadKey);
+        java.io.FileOutputStream fos = tempUploadStreams.remove(uploadKey);
+        if (fos != null) {
+            try { fos.close(); } catch (IOException e) {}
+        }
+        java.io.File tempFile = tempUploadFiles.remove(uploadKey);
+        if (tempFile != null && tempFile.exists()) {
+            tempFile.delete();
         }
     }
     
@@ -702,13 +705,11 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
     
     // 处理SFTP上传请求
     private void handleSFTPUploadRequest(WebSocketSession session, JsonNode rootNode) {
-        // 这里我们只是准备接收文件数据，实际的上传处理在handleSFTPData方法中
-        
         try {
             String fileName = rootNode.get("fileName").asText();
             String remotePath = rootNode.get("remotePath").asText();
+            long fileSize = rootNode.has("fileSize") ? rootNode.get("fileSize").asLong() : 0;
             
-            // 验证远程路径是否有效
             String sessionId = session.getId();
             ChannelSftp channel = getSFTPChannel(sessionId);
             
@@ -717,8 +718,7 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
                 return;
             }
             
-            // 检查路径是否存在，如果不存在则记录但不报错
-            // 实际创建目录的操作将在handleSFTPData中进行
+            // 检查远程路径是否存在
             boolean pathExists = true;
             try {
                 channel.stat(remotePath);
@@ -728,11 +728,30 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
                 }
             }
             
+            // 检查远程文件是否已存在（用于断点续传）
+            long remoteExistingSize = 0;
+            String remoteFilePath;
+            if (remotePath.endsWith("/")) {
+                remoteFilePath = remotePath + fileName;
+            } else {
+                remoteFilePath = remotePath + "/" + fileName;
+            }
+            try {
+                SftpATTRS attrs = channel.stat(remoteFilePath);
+                if (!attrs.isDir()) {
+                    remoteExistingSize = attrs.getSize();
+                }
+            } catch (SftpException e) {
+                // 文件不存在，remoteExistingSize 保持 0
+            }
+            
             Map<String, Object> response = new HashMap<>();
             response.put("type", "sftp_upload_ready");
             response.put("fileName", fileName);
             response.put("remotePath", remotePath);
             response.put("pathExists", pathExists);
+            response.put("remoteExistingSize", remoteExistingSize);
+            response.put("fileSize", fileSize);
             send(session, new TextMessage(mapper.writeValueAsString(response)));
         } catch (Exception e) {
             e.printStackTrace();
@@ -740,11 +759,23 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
         }
     }
     
-    // 存储分片上传的临时数据
+    // 存储分片上传的临时文件
+    private ConcurrentHashMap<String, java.io.File> tempUploadFiles = new ConcurrentHashMap<>();
+    
+    // 存储分片上传的临时文件输出流
+    private ConcurrentHashMap<String, java.io.FileOutputStream> tempUploadStreams = new ConcurrentHashMap<>();
+    
+    // 旧版 base64 上传的内存缓冲（向后兼容）
     private ConcurrentHashMap<String, ByteArrayOutputStream> chunkUploads = new ConcurrentHashMap<>();
     
     // 存储分片上传的进度信息
     private ConcurrentHashMap<String, Integer> chunkProgress = new ConcurrentHashMap<>();
+    
+    // 存储SFTP直接写入流（新上传时直接写远程文件，不经过临时文件）
+    private ConcurrentHashMap<String, OutputStream> sftpUploadStreams = new ConcurrentHashMap<>();
+    
+    // 存储上传过程中的 MD5 增量摘要（无需临时文件即可计算本地 MD5）
+    private ConcurrentHashMap<String, java.security.MessageDigest> uploadMd5Digests = new ConcurrentHashMap<>();
     
     // 处理SFTP文件数据
     private void handleSFTPData(WebSocketSession session, JsonNode rootNode) {
@@ -772,6 +803,7 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
             uploadInfo.put("isLastChunk", isLastChunk);
             uploadInfo.put("chunkIndex", chunkIndex);
             uploadInfo.put("totalChunks", totalChunks);
+            uploadInfo.put("resumeUpload", rootNode.has("resumeUpload") && rootNode.get("resumeUpload").asBoolean());
             
             // 设置待处理标记
             pendingBinaryUploads.put(sessionId, uploadInfo);
@@ -1208,6 +1240,28 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
         try {
             java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
             byte[] digest = md.digest(data);
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) {
+                sb.append(String.format("%02x", b & 0xff));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return "计算失败: " + e.getMessage();
+        }
+    }
+    
+    // 计算本地临时文件的 MD5
+    private String calculateFileMD5(java.io.File file) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+                byte[] buffer = new byte[256 * 1024];
+                int len;
+                while ((len = fis.read(buffer)) != -1) {
+                    md.update(buffer, 0, len);
+                }
+            }
+            byte[] digest = md.digest();
             StringBuilder sb = new StringBuilder();
             for (byte b : digest) {
                 sb.append(String.format("%02x", b & 0xff));
