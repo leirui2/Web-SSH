@@ -41,3 +41,5 @@ png/
 
 # Project documentation (not for version control)
 sql/
+
+ssh_server_configs.json

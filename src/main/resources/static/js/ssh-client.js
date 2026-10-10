@@ -9,6 +9,72 @@ let socket = null;
 let currentKeyGroup = null; // 当前选中的按键组
 let keyGroups = []; // 所有按键组
 
+// ============ 自定义弹窗（替代原生 alert/confirm） ============
+// SFTP 错误码友好提示映射
+function friendlySFTPError(error) {
+    if (!error) return '未知错误';
+    const e = error.toUpperCase();
+    if (e.includes('PERMISSION_DENIED')) return '没有写入权限，请检查远程目录权限';
+    if (e.includes('NO_SUCH_FILE')) return '文件或目录不存在';
+    if (e.includes('NO_SPACE')) return '远程磁盘空间不足';
+    if (e.includes('QUOTA_EXCEEDED')) return '超出远程磁盘配额';
+    if (e.includes('FILE_ALREADY_EXISTS')) return '文件已存在';
+    if (e.includes('CONNECTION_REFUSED')) return '连接被拒绝';
+    if (e.includes('TIMEOUT')) return '连接超时';
+    if (e.includes('AUTH') || e.includes('PERMISSION')) return '认证失败或权限不足';
+    return error;
+}
+
+function showAlert(message, title) {
+    const overlay = document.getElementById('custom-overlay');
+    document.getElementById('custom-dialog-title').textContent = title || '提示';
+    document.getElementById('custom-dialog-body').textContent = message;
+    const footer = document.getElementById('custom-dialog-footer');
+    footer.innerHTML = '';
+    const btn = document.createElement('button');
+    btn.className = 'custom-btn custom-btn-primary';
+    btn.textContent = '确定';
+    btn.onclick = () => { overlay.style.display = 'none'; };
+    footer.appendChild(btn);
+    overlay.style.display = 'block';
+    btn.focus();
+}
+
+function showConfirm(message, onConfirm, onCancel, title) {
+    const overlay = document.getElementById('custom-overlay');
+    document.getElementById('custom-dialog-title').textContent = title || '确认';
+    document.getElementById('custom-dialog-body').textContent = message;
+    const footer = document.getElementById('custom-dialog-footer');
+    footer.innerHTML = '';
+    const btnCancel = document.createElement('button');
+    btnCancel.className = 'custom-btn custom-btn-secondary';
+    btnCancel.textContent = '取消';
+    const btnConfirm = document.createElement('button');
+    btnConfirm.className = 'custom-btn custom-btn-primary';
+    btnConfirm.textContent = '确定';
+    const close = () => { overlay.style.display = 'none'; };
+    btnCancel.onclick = () => { close(); if (onCancel) onCancel(); };
+    btnConfirm.onclick = () => { close(); if (onConfirm) onConfirm(); };
+    footer.appendChild(btnCancel);
+    footer.appendChild(btnConfirm);
+    overlay.style.display = 'block';
+    btnConfirm.focus();
+}
+
+// 点击遮罩层空白区域关闭弹窗
+document.addEventListener('DOMContentLoaded', () => {
+    const overlay = document.getElementById('custom-overlay');
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) overlay.style.display = 'none';
+    });
+    document.getElementById('custom-dialog-close').addEventListener('click', () => {
+        overlay.style.display = 'none';
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && overlay.style.display === 'block') overlay.style.display = 'none';
+    });
+});
+
 // 初始化终端
 term.loadAddon(fitAddon);
 const terminalElement = document.getElementById('terminal');
@@ -96,6 +162,15 @@ window.addEventListener('resize', () => {
 });
 
 // SFTP相关功能
+let uploadQueue = [];
+let currentUploadFile = null;
+let currentUploadRemotePath = null;
+let uploadCancelled = false;
+let downloadCancelled = false;
+let fileSortColumn = 'name';
+let fileSortAsc = true;
+let currentFileList = [];
+
 function initSFTPControls() {
     // 文件列表按钮事件
     document.getElementById('list-files-btn').addEventListener('click', listRemoteFiles);
@@ -105,19 +180,45 @@ function initSFTPControls() {
         document.getElementById('file-upload').click();
     });
     
-    // 文件选择事件
+    // 文件选择事件（多文件）
     document.getElementById('file-upload').addEventListener('change', handleFileUpload);
+    
+    // 取消上传/下载
+    document.getElementById('cancel-upload-btn').addEventListener('click', cancelUpload);
+    document.getElementById('cancel-download-btn').addEventListener('click', cancelDownload);
     
     // 文件下载按钮事件
     document.getElementById('download-btn').addEventListener('click', downloadFile);
     
     // 返回上一级目录按钮事件
     document.getElementById('parent-dir-btn').addEventListener('click', navigateToParentDirectory);
+    
+    // 文件搜索
+    document.getElementById('file-search').addEventListener('input', () => {
+        displayFileList(currentFileList);
+    });
+    
+    // 拖拽上传
+    const sftpControls = document.getElementById('sftp-controls');
+    sftpControls.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        sftpControls.style.borderColor = '#4CAF50';
+        sftpControls.style.borderWidth = '2px';
+    });
+    sftpControls.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        sftpControls.style.borderColor = '#ddd';
+        sftpControls.style.borderWidth = '1px';
+    });
+    sftpControls.addEventListener('drop', handleDrop);
 }
 
-// 显示文件列表
+// 显示文件列表（支持排序+搜索）
 function displayFileList(files) {
+    currentFileList = files || [];
     const fileListElement = document.getElementById('file-list');
+    fileListElement.style.display = 'block';
     fileListElement.innerHTML = '';
     
     if (!files || files.length === 0) {
@@ -125,20 +226,76 @@ function displayFileList(files) {
         return;
     }
     
+    // 搜索过滤
+    const searchTerm = (document.getElementById('file-search')?.value || '').toLowerCase();
+    let filteredFiles = files;
+    if (searchTerm) {
+        filteredFiles = files.filter(f => f.name.toLowerCase().includes(searchTerm));
+    }
+    
+    if (filteredFiles.length === 0) {
+        fileListElement.innerHTML = '<p>没有匹配的文件</p>';
+        return;
+    }
+    
+    // 排序
+    const sortedFiles = [...filteredFiles].sort((a, b) => {
+        // 目录始终排在前面
+        if (a.isDirectory && !b.isDirectory) return -1;
+        if (!a.isDirectory && b.isDirectory) return 1;
+        
+        let cmp = 0;
+        switch (fileSortColumn) {
+            case 'name':
+                cmp = a.name.localeCompare(b.name);
+                break;
+            case 'size':
+                cmp = (a.size || 0) - (b.size || 0);
+                break;
+            case 'modifiedTime':
+                cmp = (a.modifiedTime || 0) - (b.modifiedTime || 0);
+                break;
+            case 'permissions':
+                cmp = (a.permissions || '').localeCompare(b.permissions || '');
+                break;
+            default:
+                cmp = a.name.localeCompare(b.name);
+        }
+        return fileSortAsc ? cmp : -cmp;
+    });
+    
     const table = document.createElement('table');
     table.style.width = '100%';
     table.style.borderCollapse = 'collapse';
     
-    // 添加表头
+    // 添加表头（可点击排序）
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    const headers = ['文件名', '类型', '大小', '权限', '修改时间'];
-    headers.forEach(headerText => {
+    const headers = [
+        { key: 'name', label: '文件名' },
+        { key: 'type', label: '类型' },
+        { key: 'size', label: '大小' },
+        { key: 'permissions', label: '权限' },
+        { key: 'modifiedTime', label: '修改时间' }
+    ];
+    headers.forEach(h => {
         const th = document.createElement('th');
-        th.textContent = headerText;
+        const arrow = (fileSortColumn === h.key) ? (fileSortAsc ? ' ▲' : ' ▼') : '';
+        th.textContent = h.label + arrow;
         th.style.border = '1px solid #ddd';
         th.style.padding = '5px';
         th.style.textAlign = 'left';
+        th.style.cursor = 'pointer';
+        th.style.userSelect = 'none';
+        th.onclick = () => {
+            if (fileSortColumn === h.key) {
+                fileSortAsc = !fileSortAsc;
+            } else {
+                fileSortColumn = h.key;
+                fileSortAsc = true;
+            }
+            displayFileList(currentFileList);
+        };
         headerRow.appendChild(th);
     });
     thead.appendChild(headerRow);
@@ -146,7 +303,7 @@ function displayFileList(files) {
     
     // 添加文件列表
     const tbody = document.createElement('tbody');
-    files.forEach(file => {
+    sortedFiles.forEach(file => {
         const row = document.createElement('tr');
         row.style.cursor = 'pointer';
         row.onclick = () => {
@@ -191,7 +348,7 @@ function formatFileSize(bytes) {
 // 列出远程文件
 function listRemoteFiles() {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-        alert('请先连接到SSH服务器');
+        showAlert('请先连接到SSH服务器');
         return;
     }
     
@@ -203,61 +360,187 @@ function listRemoteFiles() {
     socket.send(msg);
 }
 
-// 处理文件上传
+// 处理文件上传（多文件队列）
 function handleFileUpload(event) {
-    const file = event.target.files[0];
-    if (!file) return;
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
     
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-        alert('请先连接到SSH服务器');
+        showAlert('请先连接到SSH服务器');
         return;
     }
     
     const remotePath = document.getElementById('remote-path').value || '/';
     
-    // 创建进度显示元素
-    const progressDiv = document.createElement('div');
-    progressDiv.id = 'upload-progress';
-    progressDiv.style.margin = '10px 0';
-    progressDiv.innerHTML = `<strong>上传进度:</strong> <span id="progress-text">准备中...</span>
-                            <div style="width:100%; background:#eee; height:20px; margin-top:5px;">
-                                <div id="progress-bar" style="width:0%; background:#4CAF50; height:20px;"></div>
-                            </div>`;
+    // 构建上传队列
+    uploadQueue = [];
+    for (let i = 0; i < files.length; i++) {
+        uploadQueue.push({ file: files[i], remotePath: remotePath, relativePath: '' });
+    }
     
-    const sftpControls = document.getElementById('sftp-controls');
-    const oldProgress = document.getElementById('upload-progress');
-    if (oldProgress) oldProgress.remove();
-    sftpControls.appendChild(progressDiv);
-    
-    // 保存文件信息，等待 sftp_upload_ready 响应后开始流式上传
-    window.pendingUploadFile = file;
-    window.pendingUploadRemotePath = remotePath;
-    
-    // 发送上传请求（仅元数据，不含文件数据）
-    const msg = JSON.stringify({
-        type: 'sftp_upload',
-        remotePath: remotePath,
-        fileName: file.name,
-        fileSize: file.size
-    });
-    socket.send(msg);
-    document.getElementById('progress-text').textContent = '等待服务器响应...';
+    showUploadProgress();
+    processUploadQueue();
     
     document.getElementById('file-upload').value = '';
 }
 
-// 流式分片上传（支持断点续传 + 背压控制）
+// 处理拖拽上传
+async function handleDrop(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const sftpControls = document.getElementById('sftp-controls');
+    sftpControls.style.borderColor = '#ddd';
+    sftpControls.style.borderWidth = '1px';
+    
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+        showAlert('请先连接到SSH服务器');
+        return;
+    }
+    
+    const baseRemotePath = document.getElementById('remote-path').value || '/';
+    const items = e.dataTransfer.items;
+    uploadQueue = [];
+    
+    if (items && items.length > 0 && items[0].webkitGetAsEntry) {
+        // 支持文件夹拖拽
+        const entries = [];
+        for (let i = 0; i < items.length; i++) {
+            const entry = items[i].webkitGetAsEntry();
+            if (entry) entries.push(entry);
+        }
+        for (const entry of entries) {
+            await traverseEntry(entry, '', baseRemotePath);
+        }
+    } else {
+        // 仅文件拖拽
+        const files = e.dataTransfer.files;
+        for (let i = 0; i < files.length; i++) {
+            uploadQueue.push({ file: files[i], remotePath: baseRemotePath, relativePath: '' });
+        }
+    }
+    
+    if (uploadQueue.length > 0) {
+        showUploadProgress();
+        processUploadQueue();
+    }
+}
+
+// 递归遍历拖拽的目录项
+function traverseEntry(entry, relPath, baseRemotePath) {
+    return new Promise((resolve) => {
+        if (entry.isFile) {
+            entry.file((file) => {
+                uploadQueue.push({ file: file, remotePath: baseRemotePath, relativePath: relPath });
+                resolve();
+            });
+        } else if (entry.isDirectory) {
+            const dirReader = entry.createReader();
+            const readEntries = () => {
+                dirReader.readEntries(async (entries) => {
+                    if (entries.length === 0) { resolve(); return; }
+                    const currentRel = relPath ? relPath + '/' + entry.name : entry.name;
+                    for (const childEntry of entries) {
+                        await traverseEntry(childEntry, currentRel, baseRemotePath);
+                    }
+                    readEntries();
+                });
+            };
+            readEntries();
+        } else {
+            resolve();
+        }
+    });
+}
+
+// 显示上传进度区域
+function showUploadProgress() {
+    const progressDiv = document.getElementById('upload-progress');
+    progressDiv.style.display = 'block';
+    document.getElementById('cancel-upload-btn').style.display = 'inline-block';
+    document.getElementById('progress-text').textContent = `准备上传 ${uploadQueue.length} 个文件...`;
+    document.getElementById('progress-bar').style.width = '0%';
+    document.getElementById('speed-text').textContent = '';
+}
+
+// 处理上传队列
+function processUploadQueue() {
+    if (uploadCancelled) {
+        uploadQueue = [];
+        uploadCancelled = false;
+        document.getElementById('cancel-upload-btn').style.display = 'none';
+        return;
+    }
+    
+    if (uploadQueue.length === 0) {
+        currentUploadFile = null;
+        document.getElementById('cancel-upload-btn').style.display = 'none';
+        return;
+    }
+    
+    const item = uploadQueue.shift();
+    currentUploadFile = item.file;
+    currentUploadRemotePath = item.remotePath;
+    
+    // 计算实际远程路径（含子目录）
+    let actualRemotePath = item.remotePath;
+    if (item.relativePath) {
+        actualRemotePath = item.remotePath.replace(/\/$/, '') + '/' + item.relativePath;
+    }
+    
+    window.pendingUploadFile = item.file;
+    window.pendingUploadRemotePath = actualRemotePath;
+    
+    const remaining = uploadQueue.length;
+    const pt = document.getElementById('progress-text');
+    if (pt) pt.textContent = `[${remaining > 0 ? '队列剩 ' + remaining + ' 个' : '最后一个'}] ${item.file.name} - 等待服务器响应...`;
+    
+    // 发送上传请求
+    const msg = JSON.stringify({
+        type: 'sftp_upload',
+        remotePath: actualRemotePath,
+        fileName: item.file.name,
+        fileSize: item.file.size
+    });
+    socket.send(msg);
+}
+
+// 取消上传
+function cancelUpload() {
+    uploadCancelled = true;
+    if (currentUploadFile && socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'sftp_upload_cancel', fileName: currentUploadFile.name }));
+    }
+    uploadQueue = [];
+    const pt = document.getElementById('progress-text');
+    if (pt) pt.textContent = '上传已取消';
+    document.getElementById('cancel-upload-btn').style.display = 'none';
+}
+
+// 取消下载
+function cancelDownload() {
+    downloadCancelled = true;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'sftp_download_cancel' }));
+    }
+    document.getElementById('cancel-download-btn').style.display = 'none';
+}
+
+// 流式分片上传（支持断点续传 + 背压控制 + 速度显示）
 function startStreamingUpload(file, remotePath, offset, resumeUpload) {
     const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
     const remainingSize = file.size - offset;
     const totalChunks = Math.ceil(remainingSize / CHUNK_SIZE);
     let chunkIndex = 0;
     let sentBytes = 0;
+    const startTime = Date.now();
     
     const progressText = document.getElementById('progress-text');
     const progressBar = document.getElementById('progress-bar');
+    const speedText = document.getElementById('speed-text');
     
     const sendChunk = () => {
+        if (uploadCancelled) return;
+        
         if (chunkIndex >= totalChunks) {
             progressText.textContent = '所有分片已发送，等待服务器处理...';
             return;
@@ -282,6 +565,8 @@ function startStreamingUpload(file, remotePath, offset, resumeUpload) {
         const chunkBlob = file.slice(start, end);
         const reader = new FileReader();
         reader.onload = (e) => {
+            if (uploadCancelled) return;
+            
             const chunkData = e.target.result;
             
             // 发送元数据
@@ -305,7 +590,16 @@ function startStreamingUpload(file, remotePath, offset, resumeUpload) {
             const sentMB = (sentBytes / 1024 / 1024).toFixed(1);
             const totalMB = (remainingSize / 1024 / 1024).toFixed(1);
             const tag = resumeUpload ? ' [续传]' : '';
-            progressText.textContent = `${percent}% (${sentMB}MB / ${totalMB}MB)${tag}`;
+            const queueTag = uploadQueue.length > 0 ? ` [队列剩 ${uploadQueue.length}]` : '';
+            
+            // 速度计算
+            const elapsed = (Date.now() - startTime) / 1000;
+            const speed = elapsed > 0 ? (sentBytes / 1024 / 1024 / elapsed).toFixed(1) : '0';
+            const remainBytes = remainingSize - sentBytes;
+            const remainTime = elapsed > 0 && speed > 0 ? Math.ceil(remainBytes / 1024 / 1024 / speed) : 0;
+            
+            progressText.textContent = `${file.name}: ${percent}% (${sentMB}MB / ${totalMB}MB)${tag}${queueTag}`;
+            if (speedText) speedText.textContent = `${speed} MB/s, 剩余 ${remainTime}s`;
             progressBar.style.width = `${percent}%`;
             
             chunkIndex++;
@@ -323,7 +617,7 @@ function startStreamingUpload(file, remotePath, offset, resumeUpload) {
 // 下载文件
 function downloadFile() {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-        alert('请先连接到SSH服务器');
+        showAlert('请先连接到SSH服务器');
         return;
     }
     
@@ -331,7 +625,7 @@ function downloadFile() {
     const fileName = document.getElementById('local-file-path').value;
     
     if (!fileName) {
-        alert('请输入要下载的文件名');
+        showAlert('请输入要下载的文件名');
         return;
     }
     
@@ -345,6 +639,7 @@ function downloadFile() {
     
     // 设置全局变量，用于识别接下来的二进制响应是文件下载
     window.expectedFileDownload = fileName;
+    downloadCancelled = false;
     
     const msg = JSON.stringify({
         type: 'sftp_download',
@@ -741,7 +1036,7 @@ function loadKeyButtons() {
                 });
                 socket.send(dataMsg);
             } else {
-                alert('请先连接到SSH服务器');
+                showAlert('请先连接到SSH服务器');
             }
         });
         
@@ -758,7 +1053,7 @@ function loadKeyButtons() {
 // 显示添加按键对话框
 function showAddKeyModal() {
     if (!currentKeyGroup) {
-        alert('请先选择或创建一个按键组');
+        showAlert('请先选择或创建一个按键组');
         return;
     }
     
@@ -785,7 +1080,7 @@ function showEditKeyModal(key) {
 // 保存按键
 function saveKey() {
     if (!currentKeyGroup) {
-        alert('请先选择或创建一个按键组');
+        showAlert('请先选择或创建一个按键组');
         return;
     }
     
@@ -795,7 +1090,7 @@ function saveKey() {
     const keyColor = document.getElementById('key-edit-color').value;
     
     if (!keyLabel || !keyCommand) {
-        alert('请填写有效的按键标签和命令');
+        showAlert('请填写有效的按键标签和命令');
         return;
     }
     
@@ -839,7 +1134,7 @@ function saveKey() {
         })
         .catch(error => {
             console.error('保存按键失败:', error);
-            alert('保存按键失败: ' + error.message);
+            showAlert('保存按键失败: ' + error.message);
         });
 }
 
@@ -854,10 +1149,7 @@ function deleteKey() {
         return;
     }
     
-    if (!confirm('确定要删除这个按键吗？')) {
-        return;
-    }
-    
+    showConfirm('确定要删除这个按键吗？', () => {
     // 从按键组中删除按键
     currentKeyGroup.keys = currentKeyGroup.keys.filter(key => key.id !== keyId);
     
@@ -869,8 +1161,9 @@ function deleteKey() {
         })
         .catch(error => {
             console.error('删除按键失败:', error);
-            alert('删除按键失败: ' + error.message);
+            showAlert('删除按键失败: ' + error.message);
         });
+    });
 }
 
 // 显示添加按键组对话框
@@ -886,7 +1179,7 @@ function showAddGroupModal() {
 // 显示编辑按键组对话框
 function showEditGroupModal() {
     if (!currentKeyGroup) {
-        alert('请先选择一个按键组');
+        showAlert('请先选择一个按键组');
         return;
     }
     
@@ -973,7 +1266,7 @@ function saveKeyGroup() {
     const groupName = document.getElementById('group-edit-name').value.trim();
     
     if (!groupName) {
-        alert('请填写有效的按键组名称');
+        showAlert('请填写有效的按键组名称');
         return;
     }
     
@@ -986,7 +1279,7 @@ function saveKeyGroup() {
         // 更新现有按键组
         keyGroup = keyGroups.find(group => group.id === groupId);
         if (!keyGroup) {
-            alert('错误: 找不到要更新的按键组');
+            showAlert('错误: 找不到要更新的按键组');
             console.error('找不到按键组:', groupId);
             return;
         }
@@ -1027,7 +1320,7 @@ function saveKeyGroup() {
         })
         .catch(error => {
             console.error('保存按键组失败:', error);
-            alert('保存按键组失败: ' + error.message);
+            showAlert('保存按键组失败: ' + error.message);
         });
 }
 
@@ -1038,10 +1331,7 @@ function deleteKeyGroup() {
         return;
     }
     
-    if (!confirm('确定要删除这个按键组吗？')) {
-        return;
-    }
-    
+    showConfirm('确定要删除这个按键组吗？', () => {
     // 从服务器删除按键组
     fetch(`/api/terminal-key-groups/${groupId}`, {
         method: 'DELETE'
@@ -1057,7 +1347,8 @@ function deleteKeyGroup() {
     })
     .catch(error => {
         console.error('删除按键组失败:', error);
-        alert('删除按键组失败: ' + error.message);
+        showAlert('删除按键组失败: ' + error.message);
+    });
     });
 }
 
@@ -1134,7 +1425,7 @@ function connect() {
     const authMethod = document.getElementById('auth-method').value;
     
     if (!host || !username) {
-        alert('请填写主机和用户名');
+        showAlert('请填写主机和用户名');
         return;
     }
     
@@ -1142,7 +1433,7 @@ function connect() {
     if (authMethod === 'password') {
         const password = document.getElementById('password').value;
         if (!password) {
-            alert('请填写密码');
+            showAlert('请填写密码');
             return;
         }
         authData = {
@@ -1152,7 +1443,7 @@ function connect() {
     } else {
         const privateKey = document.getElementById('private-key').value.trim();
         if (!privateKey) {
-            alert('请提供私钥内容');
+            showAlert('请提供私钥内容');
             return;
         }
         authData = {
@@ -1213,9 +1504,13 @@ function connect() {
                     const progress = window.fileDownloadTotal > 0
                         ? Math.round(window.fileDownloadReceived / window.fileDownloadTotal * 100)
                         : 0;
+                    const elapsed = (Date.now() - (window.fileDownloadStartTime || Date.now())) / 1000;
+                    const speed = elapsed > 0 ? (window.fileDownloadReceived / 1024 / 1024 / elapsed).toFixed(1) : '0';
+                    const remainBytes = window.fileDownloadTotal - window.fileDownloadReceived;
+                    const remainTime = elapsed > 0 && speed > 0 ? Math.ceil(remainBytes / 1024 / 1024 / speed) : 0;
                     const statusEl = document.getElementById('status');
                     if (statusEl) {
-                        statusEl.textContent = `下载中 ${window.fileDownloadName}: ${progress}% (${(window.fileDownloadReceived/1024/1024).toFixed(1)}MB / ${(window.fileDownloadTotal/1024/1024).toFixed(1)}MB)`;
+                        statusEl.textContent = `下载 ${window.fileDownloadName}: ${progress}% (${(window.fileDownloadReceived/1024/1024).toFixed(1)}MB / ${(window.fileDownloadTotal/1024/1024).toFixed(1)}MB) ${speed}MB/s 剩余${remainTime}s`;
                     }
                     return;
                 }
@@ -1233,7 +1528,7 @@ function connect() {
                     document.body.removeChild(a);
                     URL.revokeObjectURL(url);
                     
-                    alert('文件下载成功: ' + window.expectedFileDownload);
+                    showAlert('文件下载成功: ' + window.expectedFileDownload);
                     window.expectedFileDownload = null;
                     return;
                 }
@@ -1312,27 +1607,28 @@ function connect() {
                                 let resumeUpload = false;
                                 
                                 if (remoteExistingSize > 0 && remoteExistingSize < file.size) {
-                                    if (confirm(`远程文件已存在 ${(remoteExistingSize/1024/1024).toFixed(1)}MB，本地文件 ${(file.size/1024/1024).toFixed(1)}MB。\n是否断点续传？`)) {
-                                        offset = remoteExistingSize;
-                                        resumeUpload = true;
-                                    }
+                                    showConfirm(`远程文件已存在 ${(remoteExistingSize/1024/1024).toFixed(1)}MB，本地文件 ${(file.size/1024/1024).toFixed(1)}MB。\n是否断点续传？`, () => {
+                                        startStreamingUpload(file, remotePath, remoteExistingSize, true);
+                                    }, () => {
+                                        startStreamingUpload(file, remotePath, 0, false);
+                                    }, '断点续传');
                                 } else if (remoteExistingSize === file.size && file.size > 0) {
-                                    if (!confirm(`远程文件已存在且大小相同 (${(file.size/1024/1024).toFixed(1)}MB)。\n是否重新上传覆盖？`)) {
+                                    showConfirm(`远程文件已存在且大小相同 (${(file.size/1024/1024).toFixed(1)}MB)。\n是否重新上传覆盖？`, () => {
+                                        startStreamingUpload(file, remotePath, 0, false);
+                                    }, () => {
                                         window.pendingUploadFile = null;
-                                        const pt = document.getElementById('progress-text');
-                                        if (pt) pt.textContent = '已取消';
-                                        break;
-                                    }
+                                        processUploadQueue();
+                                    }, '覆盖确认');
                                 } else if (remoteExistingSize > file.size) {
-                                    if (!confirm(`远程文件 (${(remoteExistingSize/1024/1024).toFixed(1)}MB) 比本地文件 (${(file.size/1024/1024).toFixed(1)}MB) 大。\n是否重新上传覆盖？`)) {
+                                    showConfirm(`远程文件 (${(remoteExistingSize/1024/1024).toFixed(1)}MB) 比本地文件 (${(file.size/1024/1024).toFixed(1)}MB) 大。\n是否重新上传覆盖？`, () => {
+                                        startStreamingUpload(file, remotePath, 0, false);
+                                    }, () => {
                                         window.pendingUploadFile = null;
-                                        const pt = document.getElementById('progress-text');
-                                        if (pt) pt.textContent = '已取消';
-                                        break;
-                                    }
+                                        processUploadQueue();
+                                    }, '覆盖确认');
+                                } else {
+                                    startStreamingUpload(file, remotePath, 0, false);
                                 }
-                                
-                                startStreamingUpload(file, remotePath, offset, resumeUpload);
                             }
                             break;
                         case 'sftp_chunk_received':
@@ -1343,7 +1639,7 @@ function connect() {
                                 window.pendingUploadFile = null;
                                 const pt = document.getElementById('progress-text');
                                 const pb = document.getElementById('progress-bar');
-                                if (pt) pt.textContent = '上传完成 ✓';
+                                if (pt) pt.textContent = '上传完成 ✓ ' + msg.fileName;
                                 if (pb) pb.style.width = '100%';
                                 let alertMsg = '文件上传成功: ' + msg.fileName;
                                 if (msg.resumed) alertMsg += ' (断点续传)';
@@ -1352,11 +1648,19 @@ function connect() {
                                     alertMsg += '\n远程 MD5:  ' + msg.remoteMd5;
                                     alertMsg += '\nMD5 校验:  ' + (msg.md5Match ? '✅ 一致' : '❌ 不一致');
                                 }
-                                alert(alertMsg);
+                                showAlert(alertMsg);
+                                // 处理队列中下一个文件
+                                processUploadQueue();
+                                // 全部上传完成，自动刷新文件列表
+                                if (uploadQueue.length === 0 && !currentUploadFile) {
+                                    listRemoteFiles();
+                                }
                             } else {
                                 const pt = document.getElementById('progress-text');
-                                if (pt) pt.textContent = '上传失败: ' + (msg.error || '未知错误');
-                                alert('文件上传失败: ' + (msg.error || '未知错误'));
+                                if (pt) pt.textContent = '上传失败: ' + friendlySFTPError(msg.error);
+                                if (!msg.cancelled) showAlert('文件上传失败: ' + friendlySFTPError(msg.error));
+                                // 失败后继续处理队列
+                                processUploadQueue();
                             }
                             break;
                         case 'sftp_download_start':
@@ -1366,12 +1670,16 @@ function connect() {
                             window.fileDownloadReceived = 0;
                             window.fileDownloadTotal = msg.fileSize;
                             window.fileDownloadName = msg.fileName;
+                            window.fileDownloadStartTime = Date.now();
                             window.expectedFileDownload = null;
+                            downloadCancelled = false;
+                            document.getElementById('cancel-download-btn').style.display = 'inline-block';
                             break;
                         case 'sftp_download_complete':
                             {
                                 console.log('[下载] 收到 complete', msg, '分块数:', window.fileDownloadChunks.length);
                                 window.fileDownloadInProgress = false;
+                                document.getElementById('cancel-download-btn').style.display = 'none';
                                 const totalSize = window.fileDownloadChunks.reduce((s, c) => s + c.byteLength, 0);
                                 console.log('[下载] 总大小:', totalSize, '字节');
                                 try {
@@ -1392,7 +1700,7 @@ function connect() {
                                     if (statusEl) statusEl.textContent = '已连接';
                                 } catch (e) {
                                     console.error('[下载] Blob 下载失败:', e);
-                                    alert('下载完成但保存失败: ' + e.message + '\n文件大小: ' + totalSize + ' 字节');
+                                    showAlert('下载完成但保存失败: ' + friendlySFTPError(e.message));
                                 }
                                 window.fileDownloadChunks = [];
                                 window.fileDownloadReceived = 0;
@@ -1404,7 +1712,13 @@ function connect() {
                             window.fileDownloadInProgress = false;
                             window.expectedFileDownload = null;
                             window.fileDownloadChunks = [];
-                            alert('文件下载失败: ' + (msg.error || '未知错误'));
+                            document.getElementById('cancel-download-btn').style.display = 'none';
+                            if (!msg.cancelled) {
+                                showAlert('文件下载失败: ' + friendlySFTPError(msg.error));
+                            } else {
+                                const statusEl = document.getElementById('status');
+                                if (statusEl) statusEl.textContent = '已连接';
+                            }
                             break;
                         case 'sftp_download_data':
                             // 处理旧版本服务器的base64响应（向后兼容）
@@ -1428,13 +1742,13 @@ function connect() {
                                     document.body.removeChild(a);
                                     URL.revokeObjectURL(url);
                                     
-                                    alert('文件下载成功: ' + msg.fileName);
+                                    showAlert('文件下载成功: ' + msg.fileName);
                                 } else {
                                     // 二进制下载准备中的消息
                                     console.log('等待二进制数据传输...');
                                 }
                             } else {
-                                alert('文件下载失败: ' + (msg.error || '未知错误'));
+                                showAlert('文件下载失败: ' + friendlySFTPError(msg.error));
                                 window.expectedFileDownload = null; // 清除下载标记
                             }
                             break;
@@ -1465,7 +1779,7 @@ function connect() {
         };
     } catch (e) {
         console.error('连接失败:', e);
-        alert('连接失败: ' + e.message);
+        showAlert('连接失败: ' + e.message);
     }
 }
 
@@ -1527,7 +1841,7 @@ window.addEventListener('beforeunload', () => {
 // 导航到上一级目录
 function navigateToParentDirectory() {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-        alert('请先连接到SSH服务器');
+        showAlert('请先连接到SSH服务器');
         return;
     }
     

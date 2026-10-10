@@ -230,6 +230,64 @@
             background: #3a6ea5 !important;
             color: #ffffff !important;
         }
+        /* 自定义弹窗样式 */
+        .custom-overlay {
+            display: none;
+            position: fixed;
+            z-index: 9999;
+            left: 0; top: 0;
+            width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.45);
+        }
+        .custom-dialog {
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            width: 420px;
+            max-width: 90%;
+            margin: 15% auto;
+            overflow: hidden;
+            animation: dialogFadeIn 0.2s ease;
+        }
+        @keyframes dialogFadeIn {
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .custom-dialog-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 20px;
+            border-bottom: 1px solid #eee;
+        }
+        .custom-dialog-title { font-size: 15px; font-weight: bold; color: #333; }
+        .custom-dialog-close { font-size: 22px; color: #aaa; cursor: pointer; line-height: 1; }
+        .custom-dialog-close:hover { color: #333; }
+        .custom-dialog-body {
+            padding: 20px;
+            font-size: 14px;
+            color: #555;
+            white-space: pre-wrap;
+            line-height: 1.6;
+        }
+        .custom-dialog-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            padding: 12px 20px;
+            border-top: 1px solid #eee;
+        }
+        .custom-btn {
+            padding: 6px 18px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .custom-btn-primary { background: #4CAF50; color: #fff; }
+        .custom-btn-primary:hover { background: #45a049; }
+        .custom-btn-secondary { background: #e0e0e0; color: #555; }
+        .custom-btn-secondary:hover { background: #d0d0d0; }
     </style>
 </head>
 <body>
@@ -309,15 +367,25 @@
                     <input type="text" id="remote-path" placeholder="远程路径 (例如: /home/user)" value="/home" style="width: 300px; padding: 5px;">
                     <button id="list-files-btn" class="btn" style="margin-left: 10px;">列出文件</button>
                     <button id="parent-dir-btn" class="btn" style="margin-left: 10px;">返回上一级</button>
+                    <input type="text" id="file-search" placeholder="搜索文件..." style="width: 150px; padding: 5px; margin-left: 10px;">
                 </div>
-                <div id="file-list" style="max-height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px;">
+                <div id="file-list" style="max-height: 250px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; display: none;">
                     <!-- 文件列表将在这里显示 -->
                 </div>
                 <div>
-                    <input type="file" id="file-upload" style="display: none;">
+                    <input type="file" id="file-upload" multiple style="display: none;">
                     <button id="upload-btn" class="btn">上传文件</button>
+                    <button id="cancel-upload-btn" class="btn" style="background-color:#f44336; display:none;">取消上传</button>
                     <input type="text" id="local-file-path" placeholder="本地文件路径" style="width: 200px; padding: 5px; margin-left: 10px;">
                     <button id="download-btn" class="btn" style="margin-left: 10px;">下载文件</button>
+                    <button id="cancel-download-btn" class="btn" style="background-color:#f44336; display:none;">取消下载</button>
+                </div>
+                <div id="upload-progress" style="margin: 10px 0; display: none;">
+                    <strong>传输进度:</strong> <span id="progress-text">准备中...</span>
+                    <span id="speed-text" style="margin-left: 15px; color: #666;"></span>
+                    <div style="width:100%; background:#eee; height:20px; margin-top:5px;">
+                        <div id="progress-bar" style="width:0%; background:#4CAF50; height:20px; transition: width 0.2s;"></div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -380,6 +448,17 @@
                     <button id="group-save-btn" class="btn">保存</button>
                 </div>
             </div>
+        </div>
+    </div>
+    <!-- 自定义弹窗 -->
+    <div id="custom-overlay" class="custom-overlay">
+        <div class="custom-dialog" id="custom-dialog">
+            <div class="custom-dialog-header">
+                <span class="custom-dialog-title" id="custom-dialog-title">提示</span>
+                <span class="custom-dialog-close" id="custom-dialog-close">&times;</span>
+            </div>
+            <div class="custom-dialog-body" id="custom-dialog-body"></div>
+            <div class="custom-dialog-footer" id="custom-dialog-footer"></div>
         </div>
     </div>
 </body>

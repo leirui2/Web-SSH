@@ -102,6 +102,7 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
                 cleanupTempUpload(key);
             }
         }
+        downloadCancelFlags.remove(sessionId);
         
         disconnectSSH(sessionId); // 确保SSH资源被正确释放
         System.out.println("WebSocket connection closed, sessionId: " + sessionId);
@@ -347,6 +348,13 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
                 case "sftp_download":
                     // 处理SFTP下载请求
                     handleSFTPDownload(session, rootNode);
+                    break;
+                case "sftp_upload_cancel":
+                    handleSFTPUploadCancel(session, rootNode);
+                    break;
+                case "sftp_download_cancel":
+                    downloadCancelFlags.put(sessionId, true);
+                    System.out.println("下载取消请求: " + sessionId);
                     break;
                 default:
                     send(session, new TextMessage("{\"type\":\"error\",\"message\":\"Unknown message type\"}"));
@@ -759,6 +767,28 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
         }
     }
     
+    // 处理上传取消请求
+    private void handleSFTPUploadCancel(WebSocketSession session, JsonNode rootNode) {
+        String sessionId = session.getId();
+        String fileName = rootNode.get("fileName").asText();
+        String uploadKey = sessionId + "_" + fileName;
+        cleanupTempUpload(uploadKey);
+        chunkProgress.remove(uploadKey);
+        pendingBinaryUploads.remove(sessionId);
+        System.out.println("上传已取消: " + fileName);
+        try {
+            Map<String, Object> response = new HashMap<>();
+            response.put("type", "sftp_upload_result");
+            response.put("success", false);
+            response.put("fileName", fileName);
+            response.put("error", "用户取消上传");
+            response.put("cancelled", true);
+            send(session, new TextMessage(mapper.writeValueAsString(response)));
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+    
     // 存储分片上传的临时文件
     private ConcurrentHashMap<String, java.io.File> tempUploadFiles = new ConcurrentHashMap<>();
     
@@ -776,6 +806,9 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
     
     // 存储上传过程中的 MD5 增量摘要（无需临时文件即可计算本地 MD5）
     private ConcurrentHashMap<String, java.security.MessageDigest> uploadMd5Digests = new ConcurrentHashMap<>();
+    
+    // 下载取消标志
+    private ConcurrentHashMap<String, Boolean> downloadCancelFlags = new ConcurrentHashMap<>();
     
     // 处理SFTP文件数据
     private void handleSFTPData(WebSocketSession session, JsonNode rootNode) {
@@ -1195,6 +1228,9 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
                 }
                 
                 private void flushChunk() throws IOException {
+                    if (downloadCancelFlags.containsKey(sessionId)) {
+                        throw new IOException("下载已取消");
+                    }
                     if (pos > 0) {
                         byte[] chunk = pos == cs ? buffer : java.util.Arrays.copyOf(buffer, pos);
                         send(sess, new BinaryMessage(chunk));
@@ -1211,15 +1247,36 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
                 public long getTotalSent() { return totalSent; }
             };
             
-            channel.get(fullPath, chunkedOutputStream);
-            
-            // channel.get 返回后显式发送完成消息（不依赖 close() 时机）
-            Map<String, Object> completeResponse = new HashMap<>();
-            completeResponse.put("type", "sftp_download_complete");
-            completeResponse.put("fileName", fileName);
-            completeResponse.put("fileSize", fileSize);
-            send(session, new TextMessage(mapper.writeValueAsString(completeResponse)));
-            System.out.println("流式下载完成: " + fileName + ", 大小: " + fileSize + " 字节");
+            // 在独立线程中执行下载，使取消消息能被处理
+            final ChannelSftp dlChannel = channel;
+            final String dlFullPath = fullPath;
+            final long dlFileSize = fileSize;
+            final String dlFileName = fileName;
+            new Thread(() -> {
+                try {
+                    dlChannel.get(dlFullPath, chunkedOutputStream);
+                    downloadCancelFlags.remove(sessionId);
+                    Map<String, Object> completeResponse = new HashMap<>();
+                    completeResponse.put("type", "sftp_download_complete");
+                    completeResponse.put("fileName", dlFileName);
+                    completeResponse.put("fileSize", dlFileSize);
+                    send(session, new TextMessage(mapper.writeValueAsString(completeResponse)));
+                    System.out.println("流式下载完成: " + dlFileName + ", 大小: " + dlFileSize + " 字节");
+                } catch (Exception e) {
+                    downloadCancelFlags.remove(sessionId);
+                    boolean cancelled = (e.getMessage() != null && e.getMessage().contains("取消"));
+                    try {
+                        Map<String, Object> response = new HashMap<>();
+                        response.put("type", "sftp_download_error");
+                        response.put("fileName", dlFileName);
+                        response.put("error", cancelled ? "用户取消下载" : e.getMessage());
+                        response.put("cancelled", cancelled);
+                        send(session, new TextMessage(mapper.writeValueAsString(response)));
+                    } catch (IOException ex) {
+                        ex.printStackTrace();
+                    }
+                }
+            }, "sftp-download-" + sessionId).start();
             
         } catch (Exception e) {
             e.printStackTrace();

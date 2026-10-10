@@ -120,6 +120,64 @@
         .nav-buttons {
             margin-bottom: 20px;
         }
+        /* 自定义弹窗样式 */
+        .custom-overlay {
+            display: none;
+            position: fixed;
+            z-index: 9999;
+            left: 0; top: 0;
+            width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.45);
+        }
+        .custom-dialog {
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            width: 420px;
+            max-width: 90%;
+            margin: 15% auto;
+            overflow: hidden;
+            animation: dialogFadeIn 0.2s ease;
+        }
+        @keyframes dialogFadeIn {
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .custom-dialog-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 20px;
+            border-bottom: 1px solid #eee;
+        }
+        .custom-dialog-title { font-size: 15px; font-weight: bold; color: #333; }
+        .custom-dialog-close { font-size: 22px; color: #aaa; cursor: pointer; line-height: 1; }
+        .custom-dialog-close:hover { color: #333; }
+        .custom-dialog-body {
+            padding: 20px;
+            font-size: 14px;
+            color: #555;
+            white-space: pre-wrap;
+            line-height: 1.6;
+        }
+        .custom-dialog-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            padding: 12px 20px;
+            border-top: 1px solid #eee;
+        }
+        .custom-btn {
+            padding: 6px 18px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .custom-btn-primary { background: #4CAF50; color: #fff; }
+        .custom-btn-primary:hover { background: #45a049; }
+        .custom-btn-secondary { background: #e0e0e0; color: #555; }
+        .custom-btn-secondary:hover { background: #d0d0d0; }
     </style>
 </head>
 <body>
@@ -191,7 +249,67 @@
         </div>
     </div>
 
+    <!-- 自定义弹窗 -->
+    <div id="custom-overlay" class="custom-overlay">
+        <div class="custom-dialog" id="custom-dialog">
+            <div class="custom-dialog-header">
+                <span class="custom-dialog-title" id="custom-dialog-title">提示</span>
+                <span class="custom-dialog-close" id="custom-dialog-close">&times;</span>
+            </div>
+            <div class="custom-dialog-body" id="custom-dialog-body"></div>
+            <div class="custom-dialog-footer" id="custom-dialog-footer"></div>
+        </div>
+    </div>
     <script>
+        // 自定义弹窗函数
+        function showAlert(message, title) {
+            const overlay = document.getElementById('custom-overlay');
+            document.getElementById('custom-dialog-title').textContent = title || '提示';
+            document.getElementById('custom-dialog-body').textContent = message;
+            const footer = document.getElementById('custom-dialog-footer');
+            footer.innerHTML = '';
+            const btn = document.createElement('button');
+            btn.className = 'custom-btn custom-btn-primary';
+            btn.textContent = '确定';
+            btn.onclick = () => { overlay.style.display = 'none'; };
+            footer.appendChild(btn);
+            overlay.style.display = 'block';
+            btn.focus();
+        }
+        function showConfirm(message, onConfirm, onCancel, title) {
+            const overlay = document.getElementById('custom-overlay');
+            document.getElementById('custom-dialog-title').textContent = title || '确认';
+            document.getElementById('custom-dialog-body').textContent = message;
+            const footer = document.getElementById('custom-dialog-footer');
+            footer.innerHTML = '';
+            const btnCancel = document.createElement('button');
+            btnCancel.className = 'custom-btn custom-btn-secondary';
+            btnCancel.textContent = '取消';
+            const btnConfirm = document.createElement('button');
+            btnConfirm.className = 'custom-btn custom-btn-primary';
+            btnConfirm.textContent = '确定';
+            const close = () => { overlay.style.display = 'none'; };
+            btnCancel.onclick = () => { close(); if (onCancel) onCancel(); };
+            btnConfirm.onclick = () => { close(); if (onConfirm) onConfirm(); };
+            footer.appendChild(btnCancel);
+            footer.appendChild(btnConfirm);
+            overlay.style.display = 'block';
+            btnConfirm.focus();
+        }
+        // 点击遮罩层关闭弹窗
+        document.addEventListener('DOMContentLoaded', () => {
+            const overlay = document.getElementById('custom-overlay');
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) overlay.style.display = 'none';
+            });
+            document.getElementById('custom-dialog-close').addEventListener('click', () => {
+                overlay.style.display = 'none';
+            });
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape' && overlay.style.display === 'block') overlay.style.display = 'none';
+            });
+        });
+
         // 当前编辑的服务器ID
         let currentEditId = null;
         
@@ -239,7 +357,7 @@
                 })
                 .catch(error => {
                     console.error('加载服务器列表失败:', error);
-                    alert('加载服务器列表失败: ' + error.message);
+                    showAlert('加载服务器列表失败: ' + error.message);
                 });
         }
         
@@ -355,13 +473,13 @@
                 return response.json();
             })
             .then(data => {
-                alert(serverId ? '服务器配置已更新' : '服务器配置已添加');
+                showAlert(serverId ? '服务器配置已更新' : '服务器配置已添加');
                 resetForm();
                 loadServerList();
             })
             .catch(error => {
                 console.error('保存服务器配置失败:', error);
-                alert('保存服务器配置失败: ' + error.message);
+                showAlert('保存服务器配置失败: ' + error.message);
             });
         }
         
@@ -384,7 +502,7 @@
         
         // 删除服务器配置
         function deleteServer(id) {
-            if (confirm('确定要删除这个服务器配置吗？')) {
+            showConfirm('确定要删除这个服务器配置吗？', () => {
                 fetch(`/api/ssh-servers/${id}`, {
                     method: 'DELETE'
                 })
@@ -396,17 +514,17 @@
                 })
                 .then(data => {
                     if (data.success) {
-                        alert('服务器配置已删除');
+                        showAlert('服务器配置已删除');
                         loadServerList();
                     } else {
-                        alert('删除服务器配置失败');
+                        showAlert('删除服务器配置失败');
                     }
                 })
                 .catch(error => {
                     console.error('删除服务器配置失败:', error);
-                    alert('删除服务器配置失败: ' + error.message);
+                    showAlert('删除服务器配置失败: ' + error.message);
                 });
-            }
+            });
         }
         
         // 重置表单
@@ -433,7 +551,7 @@
                 })
                 .catch(error => {
                     console.error('搜索服务器失败:', error);
-                    alert('搜索服务器失败: ' + error.message);
+                    showAlert('搜索服务器失败: ' + error.message);
                 });
         }
     </script>
