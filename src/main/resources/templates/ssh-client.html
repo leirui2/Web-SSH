@@ -300,6 +300,7 @@
                     <!-- 服务器选项将通过JavaScript动态添加 -->
                 </select>
                 <a href="/ssh-server-config" class="btn" style="font-size: 12px; padding: 4px 8px;">管理服务器</a>
+                <a th:if="${authEnabled}" th:href="@{/logout}" class="btn" style="font-size: 12px; padding: 4px 8px; background-color: #f44336;">登出</a>
             </div>
             <div class="form-group">
                 <label for="host">主机：</label>

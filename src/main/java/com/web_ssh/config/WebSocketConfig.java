@@ -37,9 +37,9 @@ public class WebSocketConfig implements WebSocketConfigurer {
     
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
-        // 注册SSH WebSocket处理器，允许跨域请求
+        // 注册SSH WebSocket处理器：不设置 allowedOrigins，Spring 默认只允许同源，
+        // 避免跨站 WebSocket 劫持（CSWSH）——浏览器跨站发起的握手会携带本机 session cookie。
         registry.addHandler(sshWebSocketHandler(), "/ssh-connect")
-                .setAllowedOriginPatterns("*")  // 使用setAllowedOriginPatterns代替setAllowedOrigins
                 .addInterceptors(new HttpSessionHandshakeInterceptor());
     }
     

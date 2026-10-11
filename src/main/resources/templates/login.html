@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录 - Web SSH</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; height: 100vh; display: flex; align-items: center; justify-content: center;
+            font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #1e293b, #0f172a); color: #e2e8f0;
+        }
+        .login-box {
+            width: 340px; padding: 32px 28px; background: #1e293b; border: 1px solid #334155;
+            border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, .4);
+        }
+        h1 { margin: 0 0 24px; font-size: 20px; text-align: center; font-weight: 600; }
+        label { display: block; margin-bottom: 6px; font-size: 13px; color: #94a3b8; }
+        input {
+            width: 100%; padding: 10px 12px; margin-bottom: 16px; background: #0f172a;
+            border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; font-size: 14px;
+        }
+        input:focus { outline: none; border-color: #38bdf8; }
+        button {
+            width: 100%; padding: 11px; background: #38bdf8; border: none; border-radius: 6px;
+            color: #0f172a; font-size: 15px; font-weight: 600; cursor: pointer;
+        }
+        button:hover { background: #0ea5e9; }
+        .error {
+            margin-bottom: 16px; padding: 9px 12px; background: rgba(239, 68, 68, .12);
+            border: 1px solid rgba(239, 68, 68, .4); border-radius: 6px; color: #fca5a5; font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+<form class="login-box" method="post" th:action="@{/login}">
+    <h1>Web SSH 登录</h1>
+    <div class="error" th:if="${error}" th:text="${error}"></div>
+    <label for="username">用户名</label>
+    <input type="text" id="username" name="username" autocomplete="username" autofocus required>
+    <label for="password">密码</label>
+    <input type="password" id="password" name="password" autocomplete="current-password" required>
+    <button type="submit">登 录</button>
+</form>
+</body>
+</html>

@@ -186,6 +186,7 @@
         
         <div class="nav-buttons">
             <a href="/ssh-client" class="btn">返回SSH客户端</a>
+            <a th:if="${authEnabled}" th:href="@{/logout}" class="btn" style="background-color: #f44336;">登出</a>
         </div>
         
         <div class="config-form" id="config-form">
