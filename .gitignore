@@ -42,4 +42,7 @@ png/
 # Project documentation (not for version control)
 sql/
 
+.application.properties
+.application-prod.properties
+
 ssh_server_configs.json

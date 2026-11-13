@@ -54,6 +54,8 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
     private Set<WebSocketSession> webSocketSessions = Collections.synchronizedSet(new HashSet<>());
     // 存储SFTP通道
     private ConcurrentHashMap<String, ChannelSftp> sftpChannels = new ConcurrentHashMap<>();
+    // 存储每个会话使用的认证方式（password / privatekey）
+    private ConcurrentHashMap<String, String> sshAuthTypes = new ConcurrentHashMap<>();
     
     // 重写afterConnectionEstablished方法，记录新建立的WebSocket会话
     @Override
@@ -349,6 +351,10 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
                     // 处理SFTP下载请求
                     handleSFTPDownload(session, rootNode);
                     break;
+                case "sftp_delete":
+                    // 处理SFTP删除请求（需密码二次校验）
+                    handleSFTPDelete(session, rootNode);
+                    break;
                 case "sftp_upload_cancel":
                     handleSFTPUploadCancel(session, rootNode);
                     break;
@@ -435,6 +441,7 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
             // 连接SSH服务器（设置超时时间为10秒）
             sshSession.connect(10000);
             sshSessions.put(sessionId, sshSession);
+            sshAuthTypes.put(sessionId, authType);
             
             // 打开shell通道
             Channel channel = sshSession.openChannel("shell");
@@ -538,6 +545,7 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
         
         // 移除输出流
         sshOutputStreams.remove(sessionId);
+        sshAuthTypes.remove(sessionId);
         
         // 查找对应的WebSocket会话并发送断开连接消息
         for (WebSocketSession webSocketSession : webSocketSessions) {
@@ -711,6 +719,166 @@ public class SSHWebSocketHandler extends TextWebSocketHandler {
         }
     }
     
+    // 处理SFTP删除请求（删除前用服务器密码重新认证）
+    private void handleSFTPDelete(WebSocketSession session, JsonNode rootNode) {
+        String sessionId = session.getId();
+        List<Map<String, Object>> results = new ArrayList<>();
+        int deletedCount = 0;
+
+        try {
+            String authType = sshAuthTypes.get(sessionId);
+            if (!"password".equals(authType)) {
+                sendDeleteResult(session, false, 0, results, true,
+                        "私钥连接不支持密码确认，无法删除");
+                return;
+            }
+
+            JsonNode pathsNode = rootNode.get("paths");
+            String password = rootNode.has("password") ? rootNode.get("password").asText() : "";
+            if (pathsNode == null || !pathsNode.isArray() || pathsNode.size() == 0) {
+                sendDeleteResult(session, false, 0, results, false, "未选择要删除的文件");
+                return;
+            }
+            if (password == null || password.isEmpty()) {
+                sendDeleteResult(session, false, 0, results, false, "请输入服务器密码");
+                return;
+            }
+
+            Session sshSession = sshSessions.get(sessionId);
+            if (sshSession == null || !sshSession.isConnected()) {
+                sendDeleteResult(session, false, 0, results, false, "SSH会话已断开");
+                return;
+            }
+
+            // 使用输入的密码重新建立一次 SSH 连接，验证通过后才执行删除
+            if (!verifyPassword(sshSession.getHost(), sshSession.getPort(),
+                    sshSession.getUserName(), password)) {
+                sendDeleteResult(session, false, 0, results, true, "密码验证失败，未删除任何文件");
+                return;
+            }
+
+            // 使用独立的 SFTP 通道，避免与正在进行的上传/下载冲突
+            ChannelSftp channel = (ChannelSftp) sshSession.openChannel("sftp");
+            channel.connect(5000);
+            try {
+                for (JsonNode pathNode : pathsNode) {
+                    String path = pathNode.asText();
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("path", path);
+                    item.put("name", extractFileName(path));
+
+                    if (!isSafeDeletePath(path)) {
+                        item.put("success", false);
+                        item.put("error", "非法路径，已跳过");
+                    } else {
+                        try {
+                            deleteRecursive(channel, path);
+                            item.put("success", true);
+                            deletedCount++;
+                        } catch (SftpException e) {
+                            item.put("success", false);
+                            item.put("error", e.getMessage());
+                        }
+                    }
+                    results.add(item);
+                }
+            } finally {
+                channel.disconnect();
+            }
+
+            boolean allSuccess = deletedCount == pathsNode.size();
+            sendDeleteResult(session, allSuccess, deletedCount, results, false, null);
+            System.out.println("[SFTP] 删除完成 session=" + sessionId
+                    + " 成功=" + deletedCount + "/" + pathsNode.size());
+        } catch (Exception e) {
+            e.printStackTrace();
+            sendDeleteResult(session, false, deletedCount, results, false, "删除失败: " + e.getMessage());
+        }
+    }
+
+    // 递归删除文件/目录
+    private void deleteRecursive(ChannelSftp channel, String path) throws SftpException {
+        SftpATTRS attrs = channel.lstat(path);
+        if (!attrs.isDir()) {
+            channel.rm(path);
+            return;
+        }
+
+        java.util.Vector<ChannelSftp.LsEntry> entries = channel.ls(path);
+        String prefix = path.endsWith("/") ? path : path + "/";
+        for (ChannelSftp.LsEntry entry : entries) {
+            String name = entry.getFilename();
+            if (".".equals(name) || "..".equals(name)) {
+                continue;
+            }
+            deleteRecursive(channel, prefix + name);
+        }
+        channel.rmdir(path);
+    }
+
+    // 校验删除路径，拒绝根目录、相对路径和包含 .. 的路径
+    private boolean isSafeDeletePath(String path) {
+        if (path == null || path.isEmpty() || "/".equals(path) || !path.startsWith("/")) {
+            return false;
+        }
+        for (String segment : path.split("/")) {
+            if ("..".equals(segment)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String extractFileName(String path) {
+        if (path == null) {
+            return "";
+        }
+        int idx = path.lastIndexOf('/');
+        return idx >= 0 ? path.substring(idx + 1) : path;
+    }
+
+    // 用输入的密码新建一次 SSH 连接验证密码是否正确
+    private boolean verifyPassword(String host, int port, String username, String password) {
+        Session checkSession = null;
+        try {
+            JSch jsch = new JSch();
+            checkSession = jsch.getSession(username, host, port);
+            checkSession.setPassword(password);
+            java.util.Properties config = new java.util.Properties();
+            config.put("StrictHostKeyChecking", "no");
+            checkSession.setConfig(config);
+            checkSession.connect(5000);
+            return checkSession.isConnected();
+        } catch (Exception e) {
+            System.err.println("[SFTP] 删除前密码验证失败: " + e.getMessage());
+            return false;
+        } finally {
+            if (checkSession != null) {
+                checkSession.disconnect();
+            }
+        }
+    }
+
+    private void sendDeleteResult(WebSocketSession session, boolean success, int deletedCount,
+                                  List<Map<String, Object>> results, boolean authFailed, String error) {
+        try {
+            Map<String, Object> response = new HashMap<>();
+            response.put("type", "sftp_delete_result");
+            response.put("success", success);
+            response.put("deletedCount", deletedCount);
+            response.put("results", results);
+            if (authFailed) {
+                response.put("authFailed", true);
+            }
+            if (error != null) {
+                response.put("error", error);
+            }
+            send(session, new TextMessage(mapper.writeValueAsString(response)));
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
     // 处理SFTP上传请求
     private void handleSFTPUploadRequest(WebSocketSession session, JsonNode rootNode) {
         try {

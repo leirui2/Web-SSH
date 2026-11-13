@@ -61,6 +61,74 @@ function showConfirm(message, onConfirm, onCancel, title) {
     btnConfirm.focus();
 }
 
+// 带密码输入的确认弹窗（用于删除前二次确认）
+function showPasswordConfirm(message, onConfirm, title) {
+    const overlay = document.getElementById('custom-overlay');
+    document.getElementById('custom-dialog-title').textContent = title || '确认';
+    const body = document.getElementById('custom-dialog-body');
+    body.innerHTML = '';
+
+    const messageEl = document.createElement('div');
+    messageEl.textContent = message;
+    body.appendChild(messageEl);
+
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.placeholder = '服务器密码';
+    input.style.width = '100%';
+    input.style.boxSizing = 'border-box';
+    input.style.marginTop = '12px';
+    input.style.padding = '6px 8px';
+    input.style.border = '1px solid #ddd';
+    input.style.borderRadius = '4px';
+    body.appendChild(input);
+
+    const hint = document.createElement('div');
+    hint.style.color = '#f44336';
+    hint.style.fontSize = '12px';
+    hint.style.marginTop = '6px';
+    hint.style.minHeight = '16px';
+    body.appendChild(hint);
+
+    const footer = document.getElementById('custom-dialog-footer');
+    footer.innerHTML = '';
+    const close = () => { overlay.style.display = 'none'; };
+
+    const btnCancel = document.createElement('button');
+    btnCancel.className = 'custom-btn custom-btn-secondary';
+    btnCancel.textContent = '取消';
+    btnCancel.onclick = close;
+
+    const btnConfirm = document.createElement('button');
+    btnConfirm.className = 'custom-btn custom-btn-primary';
+    btnConfirm.textContent = '确认删除';
+    const submit = () => {
+        const password = input.value;
+        if (!password) {
+            hint.textContent = '请输入服务器密码';
+            input.focus();
+            return;
+        }
+        if (onConfirm && onConfirm(password) === false) {
+            return;
+        }
+        close();
+    };
+    btnConfirm.onclick = submit;
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            submit();
+        }
+    });
+
+    footer.appendChild(btnCancel);
+    footer.appendChild(btnConfirm);
+    overlay.style.display = 'block';
+    input.value = '';
+    input.focus();
+}
+
 // 点击遮罩层空白区域关闭弹窗
 document.addEventListener('DOMContentLoaded', () => {
     const overlay = document.getElementById('custom-overlay');
@@ -170,6 +238,10 @@ let downloadCancelled = false;
 let fileSortColumn = 'name';
 let fileSortAsc = true;
 let currentFileList = [];
+let selectedFilePaths = new Set();
+let currentAuthMethod = 'password';
+let deleteInProgress = false;
+let sessionConnected = false;
 
 function initSFTPControls() {
     // 文件列表按钮事件
@@ -197,6 +269,9 @@ function initSFTPControls() {
     document.getElementById('file-search').addEventListener('input', () => {
         displayFileList(currentFileList);
     });
+
+    // 删除选中
+    document.getElementById('delete-selected-btn').addEventListener('click', deleteSelectedFiles);
     
     // 拖拽上传
     const sftpControls = document.getElementById('sftp-controls');
@@ -217,12 +292,19 @@ function initSFTPControls() {
 // 显示文件列表（支持排序+搜索）
 function displayFileList(files) {
     currentFileList = files || [];
+    // 清理已不在当前目录中的选中项，避免误删其他目录的文件
+    const availablePaths = new Set(currentFileList.map(f => f.path));
+    for (const p of Array.from(selectedFilePaths)) {
+        if (!availablePaths.has(p)) selectedFilePaths.delete(p);
+    }
+
     const fileListElement = document.getElementById('file-list');
     fileListElement.style.display = 'block';
     fileListElement.innerHTML = '';
     
     if (!files || files.length === 0) {
         fileListElement.innerHTML = '<p>目录为空</p>';
+        updateDeleteButtonState();
         return;
     }
     
@@ -235,6 +317,7 @@ function displayFileList(files) {
     
     if (filteredFiles.length === 0) {
         fileListElement.innerHTML = '<p>没有匹配的文件</p>';
+        updateDeleteButtonState();
         return;
     }
     
@@ -271,6 +354,34 @@ function displayFileList(files) {
     // 添加表头（可点击排序）
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
+
+    // 选择列（全选）
+    const selectAllTh = document.createElement('th');
+    selectAllTh.style.border = '1px solid #ddd';
+    selectAllTh.style.padding = '5px';
+    selectAllTh.style.width = '28px';
+    selectAllTh.style.textAlign = 'center';
+    const selectAllBox = document.createElement('input');
+    selectAllBox.type = 'checkbox';
+    selectAllBox.id = 'file-select-all';
+    selectAllBox.title = '全选当前列表';
+    selectAllBox.style.cursor = 'pointer';
+    selectAllBox.onclick = (e) => {
+        e.stopPropagation();
+        document.querySelectorAll('#file-list .file-row-checkbox').forEach(box => {
+            box.checked = selectAllBox.checked;
+            if (selectAllBox.checked) {
+                selectedFilePaths.add(box.dataset.path);
+            } else {
+                selectedFilePaths.delete(box.dataset.path);
+            }
+        });
+        updateDeleteButtonState();
+        syncSelectAllCheckbox();
+    };
+    selectAllTh.appendChild(selectAllBox);
+    headerRow.appendChild(selectAllTh);
+
     const headers = [
         { key: 'name', label: '文件名' },
         { key: 'type', label: '类型' },
@@ -315,6 +426,30 @@ function displayFileList(files) {
             }
         };
         
+        // 选择列
+        const selectTd = document.createElement('td');
+        selectTd.style.border = '1px solid #ddd';
+        selectTd.style.padding = '5px';
+        selectTd.style.textAlign = 'center';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'file-row-checkbox';
+        checkbox.dataset.path = file.path;
+        checkbox.checked = selectedFilePaths.has(file.path);
+        checkbox.style.cursor = 'pointer';
+        checkbox.onclick = (e) => {
+            e.stopPropagation();
+            if (checkbox.checked) {
+                selectedFilePaths.add(file.path);
+            } else {
+                selectedFilePaths.delete(file.path);
+            }
+            updateDeleteButtonState();
+            syncSelectAllCheckbox();
+        };
+        selectTd.appendChild(checkbox);
+        row.appendChild(selectTd);
+
         const cells = [
             file.name + (file.isDirectory ? '/' : ''),
             file.isDirectory ? '目录' : '文件',
@@ -335,6 +470,91 @@ function displayFileList(files) {
     });
     table.appendChild(tbody);
     fileListElement.appendChild(table);
+    syncSelectAllCheckbox();
+    updateDeleteButtonState();
+}
+
+// 同步全选框状态（全选/半选）
+function syncSelectAllCheckbox() {
+    const selectAll = document.getElementById('file-select-all');
+    if (!selectAll) return;
+    const boxes = Array.from(document.querySelectorAll('#file-list .file-row-checkbox'));
+    if (boxes.length === 0) {
+        selectAll.checked = false;
+        selectAll.indeterminate = false;
+        return;
+    }
+    const checkedCount = boxes.filter(b => b.checked).length;
+    selectAll.checked = checkedCount === boxes.length;
+    selectAll.indeterminate = checkedCount > 0 && checkedCount < boxes.length;
+}
+
+// 更新删除按钮状态
+function updateDeleteButtonState() {
+    const btn = document.getElementById('delete-selected-btn');
+    const info = document.getElementById('selection-info');
+    if (!btn) return;
+    const lockReason = currentAuthMethod !== 'password' ? '私钥连接不支持密码确认，无法删除' : '';
+
+    if (deleteInProgress) {
+        btn.disabled = true;
+        btn.textContent = '删除中...';
+        if (info) info.textContent = '';
+        return;
+    }
+
+    btn.disabled = !!lockReason || selectedFilePaths.size === 0;
+    btn.textContent = selectedFilePaths.size > 0 ? '删除选中 (' + selectedFilePaths.size + ')' : '删除选中';
+    btn.title = lockReason || '删除选中的文件或目录';
+    if (info) {
+        info.textContent = lockReason || (selectedFilePaths.size > 0 ? '已选中 ' + selectedFilePaths.size + ' 项' : '');
+    }
+}
+
+// 删除选中的文件（输入服务器密码二次确认）
+function deleteSelectedFiles() {
+    if (currentAuthMethod !== 'password') {
+        showAlert('私钥连接不支持密码确认，无法删除');
+        return;
+    }
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+        showAlert('请先连接到SSH服务器');
+        return;
+    }
+
+    const selected = currentFileList.filter(f => selectedFilePaths.has(f.path));
+    if (selected.length === 0) {
+        showAlert('请先勾选要删除的文件或目录');
+        return;
+    }
+
+    const dirCount = selected.filter(f => f.isDirectory).length;
+    const preview = selected.slice(0, 8).map(f => f.name + (f.isDirectory ? '/' : '')).join('\n');
+    let message = '即将删除 ' + selected.length + ' 项：\n' + preview;
+    if (selected.length > 8) {
+        message += '\n... 其余 ' + (selected.length - 8) + ' 项';
+    }
+    if (dirCount > 0) {
+        message += '\n\n其中 ' + dirCount + ' 个目录将连同其内容一起删除。';
+    }
+    message += '\n\n此操作不可恢复，请输入当前 SSH 用户的服务器密码确认：';
+
+    showPasswordConfirm(message, (password) => sendDeleteRequest(selected, password), '删除确认');
+}
+
+function sendDeleteRequest(selected, password) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+        showAlert('连接已断开，无法删除');
+        return false;
+    }
+    deleteInProgress = true;
+    updateDeleteButtonState();
+    socket.send(JSON.stringify({
+        type: 'sftp_delete',
+        paths: selected.map(f => f.path),
+        password: password
+    }));
+    return true;
 }
 
 // 格式化文件大小
@@ -692,6 +912,7 @@ document.getElementById('server-select').addEventListener('change', function() {
         document.getElementById('port').value = '22';
         document.getElementById('username').value = '';
         document.getElementById('password').value = '';
+        applyPrivateKeyMemoryForHost();
         return;
     }
     
@@ -703,6 +924,8 @@ document.getElementById('server-select').addEventListener('change', function() {
             document.getElementById('port').value = server.port;
             document.getElementById('username').value = server.username;
             document.getElementById('password').value = server.password;
+            // 主机确定后，按 IP 匹配并填充对应的私钥记忆
+            applyPrivateKeyMemoryForHost();
         })
         .catch(error => {
             console.error('获取服务器详情失败:', error);
@@ -715,6 +938,114 @@ document.getElementById('connect-btn').addEventListener('click', connect);
 // 断开连接按钮事件
 document.getElementById('disconnect-btn').addEventListener('click', disconnect);
 
+// ============ 私钥记忆（按服务器 IP 分别保存在本机浏览器） ============
+const PRIVATE_KEY_MEMORY_STORE = 'websshPrivateKeyByHost';
+const LEGACY_PRIVATE_KEY_KEYS = ['websshPrivateKey', 'websshPrivateKeyPassphrase', 'websshAuthMethod'];
+// 当前私钥内容是否来自自动填充（切换服务器时需要清掉）
+let privateKeyAutoFilled = false;
+
+function loadPrivateKeyStore() {
+    try {
+        const raw = localStorage.getItem(PRIVATE_KEY_MEMORY_STORE);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (e) {
+        console.error('读取私钥记忆失败:', e);
+        return {};
+    }
+}
+
+function getCurrentHost() {
+    return (document.getElementById('host').value || '').trim();
+}
+
+function updateKeyMemoryHint() {
+    const hint = document.getElementById('key-memory-hint');
+    if (!hint) return;
+    const host = getCurrentHost();
+    const record = host ? loadPrivateKeyStore()[host] : null;
+    hint.textContent = record ? ('已记住 ' + host + ' 的私钥（仅保存在本机浏览器）') : '';
+}
+
+function savePrivateKeyMemory(host, privateKey, passphrase, username, port) {
+    const key = (host || '').trim();
+    if (!key) return;
+    try {
+        const store = loadPrivateKeyStore();
+        store[key] = {
+            privateKey: privateKey,
+            passphrase: passphrase || '',
+            username: username || '',
+            port: port || 22,
+            updatedAt: Date.now()
+        };
+        localStorage.setItem(PRIVATE_KEY_MEMORY_STORE, JSON.stringify(store));
+        // 清理旧版本不分服务器的记录
+        LEGACY_PRIVATE_KEY_KEYS.forEach(k => localStorage.removeItem(k));
+        privateKeyAutoFilled = true;
+        updateKeyMemoryHint();
+    } catch (e) {
+        console.error('保存私钥记忆失败:', e);
+    }
+}
+
+function clearPrivateKeyMemory() {
+    const host = getCurrentHost();
+    const store = loadPrivateKeyStore();
+    let message;
+
+    if (!host) {
+        localStorage.removeItem(PRIVATE_KEY_MEMORY_STORE);
+        message = '已清除本机记住的所有私钥';
+    } else if (store[host]) {
+        delete store[host];
+        localStorage.setItem(PRIVATE_KEY_MEMORY_STORE, JSON.stringify(store));
+        message = '已清除 ' + host + ' 的私钥记忆';
+    } else {
+        message = '当前服务器没有已保存的私钥记忆';
+    }
+
+    LEGACY_PRIVATE_KEY_KEYS.forEach(k => localStorage.removeItem(k));
+    document.getElementById('private-key').value = '';
+    document.getElementById('private-key-file').value = '';
+    document.getElementById('passphrase').value = '';
+    privateKeyAutoFilled = false;
+    updateKeyMemoryHint();
+    showAlert(message);
+}
+
+// 按当前 host 应用对应私钥；切换到无记忆的服务器时清掉自动填充的私钥
+function applyPrivateKeyMemoryForHost() {
+    const host = getCurrentHost();
+    const record = host ? loadPrivateKeyStore()[host] : null;
+
+    if (record && record.privateKey) {
+        document.getElementById('auth-method').value = 'privatekey';
+        document.getElementById('private-key-container').style.display = 'block';
+        document.getElementById('password').required = false;
+        document.getElementById('private-key').value = record.privateKey;
+        document.getElementById('passphrase').value = record.passphrase || '';
+        privateKeyAutoFilled = true;
+    } else if (privateKeyAutoFilled) {
+        document.getElementById('private-key').value = '';
+        document.getElementById('private-key-file').value = '';
+        document.getElementById('passphrase').value = '';
+        document.getElementById('auth-method').value = 'password';
+        document.getElementById('private-key-container').style.display = 'none';
+        document.getElementById('password').required = true;
+        privateKeyAutoFilled = false;
+    }
+    updateKeyMemoryHint();
+}
+
+// 清理旧版本不分服务器的私钥记忆
+function migrateLegacyPrivateKeyMemory() {
+    LEGACY_PRIVATE_KEY_KEYS.forEach(k => {
+        if (localStorage.getItem(k)) localStorage.removeItem(k);
+    });
+}
+
 // 处理私钥文件选择
 function handlePrivateKeyFileSelect(event) {
     const file = event.target.files[0];
@@ -723,6 +1054,7 @@ function handlePrivateKeyFileSelect(event) {
     const reader = new FileReader();
     reader.onload = function(e) {
         document.getElementById('private-key').value = e.target.result;
+        privateKeyAutoFilled = false;
     };
     reader.readAsText(file);
 }
@@ -736,10 +1068,28 @@ function initEventListeners() {
             const isPrivateKey = this.value === 'privatekey';
             document.getElementById('private-key-container').style.display = isPrivateKey ? 'block' : 'none';
             document.getElementById('password').required = !isPrivateKey;
+
+            // 切换回私钥认证时，若输入框为空且当前服务器有记忆则自动填入
+            if (isPrivateKey && !document.getElementById('private-key').value.trim()) {
+                const record = loadPrivateKeyStore()[getCurrentHost()];
+                if (record) {
+                    document.getElementById('private-key').value = record.privateKey || '';
+                    document.getElementById('passphrase').value = record.passphrase || '';
+                    privateKeyAutoFilled = true;
+                    updateKeyMemoryHint();
+                }
+            }
         });
         
         // 私钥文件选择事件
         document.getElementById('private-key-file').addEventListener('change', handlePrivateKeyFileSelect);
+        document.getElementById('clear-key-memory-btn').addEventListener('click', clearPrivateKeyMemory);
+        // 用户手动编辑私钥内容后，不再视为自动填充
+        document.getElementById('private-key').addEventListener('input', function() {
+            privateKeyAutoFilled = false;
+        });
+        // 主机变化时按 IP 应用对应的私钥记忆
+        document.getElementById('host').addEventListener('change', applyPrivateKeyMemoryForHost);
         
         // 按键栏相关事件
         const addKeyBtn = document.getElementById('add-key-btn');
@@ -867,6 +1217,10 @@ loadKeyGroups().then(() => {
 
 // 初始化事件监听器
 initEventListeners();
+
+// 清理旧记忆并按当前主机恢复对应的私钥
+migrateLegacyPrivateKeyMemory();
+applyPrivateKeyMemoryForHost();
 
 // 加载按键组配置
 function loadKeyGroups() {
@@ -1419,6 +1773,9 @@ function generateUUID() {
 
 // 连接SSH服务器
 function connect() {
+    // 连接前清空上一次会话残留的文件列表与传输状态
+    resetSftpView();
+
     const host = document.getElementById('host').value;
     const port = document.getElementById('port').value;
     const username = document.getElementById('username').value;
@@ -1446,10 +1803,19 @@ function connect() {
             showAlert('请提供私钥内容');
             return;
         }
+        const passphrase = document.getElementById('passphrase').value || '';
+        // 按当前服务器 IP 记住私钥，其他服务器不会带出
+        savePrivateKeyMemory(
+            document.getElementById('host').value,
+            privateKey,
+            passphrase,
+            document.getElementById('username').value,
+            parseInt(document.getElementById('port').value) || 22
+        );
         authData = {
             type: 'privatekey',
             privateKey: privateKey,
-            passphrase: document.getElementById('passphrase').value || undefined
+            passphrase: passphrase || undefined
         };
     }
     
@@ -1565,6 +1931,10 @@ function connect() {
                                 document.getElementById('disconnect-btn').disabled = false;
                                 document.getElementById('sftp-controls').style.display = 'block';
                                 document.getElementById('terminal-keybar').style.display = 'block';
+                                currentAuthMethod = document.getElementById('auth-method').value || 'password';
+                                selectedFilePaths.clear();
+                                sessionConnected = true;
+                                updateDeleteButtonState();
                             }
                             break;
                         case 'error':
@@ -1595,6 +1965,39 @@ function connect() {
                         case 'sftp_list_result':
                             // 显示文件列表
                             displayFileList(msg.files);
+                            break;
+                        case 'sftp_delete_result':
+                            {
+                                deleteInProgress = false;
+                                updateDeleteButtonState();
+
+                                if (msg.authFailed) {
+                                    showAlert(msg.error || '密码验证失败，未执行删除');
+                                    break;
+                                }
+
+                                const results = msg.results || [];
+                                const failed = results.filter(r => !r.success);
+                                results.forEach(r => {
+                                    if (r.success) selectedFilePaths.delete(r.path);
+                                });
+
+                                if (failed.length === 0) {
+                                    const count = msg.deletedCount || results.length;
+                                    selectedFilePaths.clear();
+                                    showAlert('已删除 ' + count + ' 项');
+                                } else {
+                                    const lines = failed.slice(0, 10).map(r =>
+                                        (r.name || r.path) + '：' + friendlySFTPError(r.error));
+                                    let text = '删除完成，成功 ' + (results.length - failed.length)
+                                        + ' 项，失败 ' + failed.length + ' 项。\n\n' + lines.join('\n');
+                                    if (failed.length > 10) {
+                                        text += '\n... 其余 ' + (failed.length - 10) + ' 项失败';
+                                    }
+                                    showAlert(text, '删除结果');
+                                }
+                                listRemoteFiles();
+                            }
                             break;
                         case 'sftp_upload_ready':
                             {
@@ -1783,6 +2186,79 @@ function connect() {
     }
 }
 
+// 重置 SFTP 列表及传输相关界面状态
+function resetSftpView() {
+    currentFileList = [];
+    selectedFilePaths.clear();
+    uploadQueue = [];
+    currentUploadFile = null;
+    currentUploadRemotePath = null;
+    uploadCancelled = false;
+    downloadCancelled = false;
+    deleteInProgress = false;
+
+    const fileList = document.getElementById('file-list');
+    if (fileList) {
+        fileList.innerHTML = '';
+        fileList.style.display = 'none';
+    }
+    const fileSearch = document.getElementById('file-search');
+    if (fileSearch) fileSearch.value = '';
+    const fileUpload = document.getElementById('file-upload');
+    if (fileUpload) fileUpload.value = '';
+    const localFilePath = document.getElementById('local-file-path');
+    if (localFilePath) localFilePath.value = '';
+
+    const uploadProgress = document.getElementById('upload-progress');
+    if (uploadProgress) uploadProgress.style.display = 'none';
+    const progressText = document.getElementById('progress-text');
+    if (progressText) progressText.textContent = '准备中...';
+    const progressBar = document.getElementById('progress-bar');
+    if (progressBar) progressBar.style.width = '0%';
+    const speedText = document.getElementById('speed-text');
+    if (speedText) speedText.textContent = '';
+
+    const cancelUploadBtn = document.getElementById('cancel-upload-btn');
+    if (cancelUploadBtn) cancelUploadBtn.style.display = 'none';
+    const cancelDownloadBtn = document.getElementById('cancel-download-btn');
+    if (cancelDownloadBtn) cancelDownloadBtn.style.display = 'none';
+
+    window.fileDownloadInProgress = false;
+    window.fileDownloadChunks = [];
+    window.fileDownloadReceived = 0;
+    window.fileDownloadTotal = 0;
+    window.fileDownloadName = null;
+    window.expectedFileDownload = null;
+    window.pendingUploadFile = null;
+    window.pendingUploadRemotePath = null;
+
+    updateDeleteButtonState();
+}
+
+// 重置连接表单（恢复页面初始状态）
+function resetConnectionForm() {
+    const serverSelect = document.getElementById('server-select');
+    if (serverSelect) serverSelect.value = '';
+    localStorage.setItem('lastSelectedServer', '');
+
+    document.getElementById('host').value = '';
+    document.getElementById('port').value = '22';
+    document.getElementById('username').value = '';
+    document.getElementById('password').value = '';
+    document.getElementById('auth-method').value = 'password';
+    document.getElementById('private-key').value = '';
+    document.getElementById('private-key-file').value = '';
+    document.getElementById('passphrase').value = '';
+    document.getElementById('private-key-container').style.display = 'none';
+    privateKeyAutoFilled = false;
+
+    const remotePath = document.getElementById('remote-path');
+    if (remotePath) remotePath.value = '/home';
+
+    // 私钥记忆保留在本地，只更新提示文字
+    updateKeyMemoryHint();
+}
+
 // 断开连接
 function disconnect() {
     if (socket) {
@@ -1798,6 +2274,10 @@ function disconnect() {
         socket = null;
     }
     
+    const wasConnected = sessionConnected;
+    sessionConnected = false;
+    currentAuthMethod = 'password';
+
     // 更新UI状态
     document.getElementById('status').innerHTML = '未连接';
     document.getElementById('status').className = 'status status-disconnected';
@@ -1805,6 +2285,15 @@ function disconnect() {
     document.getElementById('disconnect-btn').disabled = true;
     document.getElementById('sftp-controls').style.display = 'none';
     document.getElementById('terminal-keybar').style.display = 'none';
+
+    // 清理文件列表、传输进度与删除状态
+    resetSftpView();
+
+    // 成功连接过的会话断开时，重置连接表单与终端，避免残留上一次的服务器信息
+    if (wasConnected) {
+        term.reset();
+        resetConnectionForm();
+    }
 }
 
 // 调整终端大小
